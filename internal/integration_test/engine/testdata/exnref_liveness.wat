@@ -78,6 +78,28 @@
     (call $churn)
     (call $rethrow (table.get $te (i32.const 2))))
 
+  ;; small reserves fewer slots than its caller. With slots numbered upward
+  ;; from a frame's base, this callee's slots land inside the caller's, and A
+  ;; parked in a later local of the caller is overwritten.
+  (func $small (result i32)
+    (local $t exnref) (local $u exnref)
+    (block $h (result exnref)
+      (try_table (catch_all_ref $h) (throw $b))
+      (unreachable))
+    (local.set $t)
+    (local.set $u (local.get $t))
+    (i32.const 0))
+
+  (func (export "exnref_callee_slots") (result i32)
+    (local $p exnref) (local $q exnref) (local $r exnref) (local $x exnref)
+    (block $h (result exnref)
+      (try_table (catch_all_ref $h) (throw $a (i32.const 18)))
+      (unreachable))
+    (local.set $x)
+    (drop (call $small))
+    (call $churn)
+    (call $rethrow (local.get $x)))
+
   ;; scrub catches many exceptions into locals, so any slot a returned frame
   ;; left behind is overwritten. Without it a stale slot can still be holding
   ;; A, and the test would pass without the global rooting anything.

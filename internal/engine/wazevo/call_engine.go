@@ -788,10 +788,22 @@ func (c *callEngine) doHandleException(exn *wasm.Exception) bool {
 // and sets localsSaveAreaPtr to the first handler that owns a save area,
 // or clears it if none is found.
 // setShadowRef roots p in the current frame's shadow slot, growing refs on
-// demand. slot is relative to the frame's shadow base, which compiled code
-// keeps in execCtx.shadowRefsTop.
+// demand.
+//
+// Slots are numbered downward from execCtx.shadowRefsTop, which the prologue
+// has already raised by the frame's slot count. A frame therefore occupies
+// exactly the range it reserved, and its callees start above it. Numbering
+// upward instead would place a frame's slots in the region its callee is
+// about to reserve, where a callee with fewer slots overwrites its caller's
+// roots.
+//
+//	refsTop after g's prologue ->  +-------+
+//	                               |  g    |  g's slots
+//	refsTop after f's prologue ->  +-------+
+//	                               |  f    |  f's slots
+//	           refsTop on entry -> +-------+
 func (c *callEngine) setShadowRef(slot int, p unsafe.Pointer) {
-	i := int(c.execCtx.shadowRefsTop) + slot
+	i := int(c.execCtx.shadowRefsTop) - 1 - slot
 	if i >= len(c.refs) {
 		c.refs = append(c.refs, make([]unsafe.Pointer, i+1-len(c.refs))...)
 	}
