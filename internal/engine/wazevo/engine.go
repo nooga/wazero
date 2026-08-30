@@ -76,7 +76,10 @@ type (
 		tryTableEnterAddress *byte
 		// tryTableLeaveAddress is the address of try_table leave trampoline.
 		tryTableLeaveAddress *byte
-		listenerTrampolines  listenerTrampolines
+		// shadowStoreAddress is the address of the shadow-store trampoline,
+		// which roots a reference in the current frame's shadow slot.
+		shadowStoreAddress  *byte
+		listenerTrampolines listenerTrampolines
 	}
 
 	listenerTrampolines = map[*wasm.FunctionType]struct {
@@ -753,7 +756,7 @@ func (e *engine) NewModuleEngine(m *wasm.Module, mi *wasm.ModuleInstance) (wasm.
 }
 
 func (e *engine) compileSharedFunctions() {
-	var sizes [12]int
+	var sizes [13]int
 	var trampolines []byte
 
 	addTrampoline := func(i int, buf []byte) {
@@ -853,6 +856,14 @@ func (e *engine) compileSharedFunctions() {
 			Results: []ssa.Type{},
 		}, false))
 
+	e.be.Init()
+	addTrampoline(12,
+		e.machine.CompileGoFunctionTrampoline(wazevoapi.ExitCodeShadowStore, &ssa.Signature{
+			// exec context, slot, ptr
+			Params:  []ssa.Type{ssa.TypeI64, ssa.TypeI64, ssa.TypeI64},
+			Results: []ssa.Type{},
+		}, false))
+
 	fns := &sharedFunctions{
 		executable:          mmapExecutable(trampolines),
 		listenerTrampolines: make(listenerTrampolines),
@@ -883,6 +894,8 @@ func (e *engine) compileSharedFunctions() {
 	fns.tryTableEnterAddress = &fns.executable[offset]
 	offset += sizes[10]
 	fns.tryTableLeaveAddress = &fns.executable[offset]
+	offset += sizes[11]
+	fns.shadowStoreAddress = &fns.executable[offset]
 
 	if wazevoapi.PerfMapEnabled {
 		wazevoapi.PerfMap.AddEntry(uintptr(unsafe.Pointer(fns.memoryGrowAddress)), uint64(sizes[0]), "memory_grow_trampoline")
@@ -897,6 +910,7 @@ func (e *engine) compileSharedFunctions() {
 		wazevoapi.PerfMap.AddEntry(uintptr(unsafe.Pointer(fns.throwTrampolineAddress)), uint64(sizes[9]), "throw_trampoline")
 		wazevoapi.PerfMap.AddEntry(uintptr(unsafe.Pointer(fns.tryTableEnterAddress)), uint64(sizes[10]), "try_table_enter_trampoline")
 		wazevoapi.PerfMap.AddEntry(uintptr(unsafe.Pointer(fns.tryTableLeaveAddress)), uint64(sizes[11]), "try_table_leave_trampoline")
+		wazevoapi.PerfMap.AddEntry(uintptr(unsafe.Pointer(fns.shadowStoreAddress)), uint64(sizes[12]), "shadow_store_trampoline")
 	}
 
 	e.sharedFunctions = fns

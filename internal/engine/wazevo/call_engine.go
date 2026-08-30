@@ -49,6 +49,26 @@ type (
 		// pendingException holds the most recently caught exception, so handler
 		// code can read its params after re-entry.
 		pendingException *wasm.Exception
+		// refs is the shadow stack. Compiled code holds references as opaque
+		// integers, which Go's collector cannot see, so every reference that
+		// enters a frame is also written here, keeping the object alive for
+		// as long as the frame owning the slot is live.
+		//
+		//	refs ([]unsafe.Pointer)
+		//	┌──────────────┐
+		//	│ nil          │  <- execCtx.shadowRefsTop
+		//	│ E ───────────┼──► *wasm.Exception   } callee frame
+		//	│ nil          │                      }
+		//	│ E' ──────────┼──► *wasm.Exception   } caller frame
+		//	└──────────────┘
+		//
+		// A frame's prologue bumps shadowRefsTop and its epilogue lowers it;
+		// slots are not cleared on the way out, so a finished frame can leave
+		// one stale pointer per slot. That is bounded and harmless: nothing
+		// reads refs for semantics, and Go's collector does not move objects,
+		// so the integer compiled code holds stays valid. Cleared when the
+		// top-level call returns.
+		refs []unsafe.Pointer
 	}
 
 	// tryHandler records the state at a try_table entry for exception handling.
@@ -147,6 +167,13 @@ type (
 		// memclrAddress holds the address of memclrNoHeapPointers implemented
 		// by the Go runtime. See memclr.go.
 		memclrAddress uintptr
+		// shadowRefsTop is the index just past the current frame's shadow
+		// slots in callEngine.refs, maintained by compiled prologues and
+		// epilogues.
+		shadowRefsTop uintptr
+		// shadowStoreTrampolineAddress holds the address of the shadow-store
+		// trampoline function.
+		shadowStoreTrampolineAddress *byte
 	}
 )
 
@@ -274,8 +301,9 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 		}
 	}
 
-	// Clear any stale try_table handlers from a previous call.
+	// Clear any stale try_table handlers and shadow roots from a previous call.
 	c.tryHandlers = c.tryHandlers[:0]
+	c.resetShadowRefs()
 
 	var paramResultPtr *uint64
 	if len(paramResultStack) > 0 {
@@ -331,6 +359,7 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 			// Ensures that we can reuse this callEngine even after an error.
 			c.execCtx.exitCode = wazevoapi.ExitCodeOK
 			c.tryHandlers = c.tryHandlers[:0]
+			c.resetShadowRefs()
 		}
 	}()
 
@@ -606,6 +635,16 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 			c.execCtx.exitCode = wazevoapi.ExitCodeOK
 			afterGoFunctionCallEntrypoint(c.execCtx.goCallReturnAddress, c.execCtxPtr,
 				uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall)), c.execCtx.framePointerBeforeGoCall)
+		case wazevoapi.ExitCodeShadowStore:
+			// Shadow store: (execCtx, slot, ptr) -> (). slot is relative to
+			// the frame's shadow base, so the absolute index sits below
+			// shadowRefsTop. Reading the pointer through the stack word
+			// avoids a uintptr conversion, which would trip checkptr.
+			s := goCallStackView(c.execCtx.stackPointerBeforeGoCall)
+			c.setShadowRef(int(s[0]), *(*unsafe.Pointer)(unsafe.Pointer(&s[1])))
+			c.execCtx.exitCode = wazevoapi.ExitCodeOK
+			afterGoFunctionCallEntrypoint(c.execCtx.goCallReturnAddress, c.execCtxPtr,
+				uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall)), c.execCtx.framePointerBeforeGoCall)
 		case wazevoapi.ExitCodeNullReference:
 			panic(wasmruntime.ErrRuntimeNullReference)
 		case wazevoapi.ExitCodeTryTableEnter:
@@ -717,6 +756,24 @@ func (c *callEngine) doHandleException(exn *wasm.Exception) bool {
 // restoreLocalsSaveAreaPtr walks tryHandlers from index `from` downward
 // and sets localsSaveAreaPtr to the first handler that owns a save area,
 // or clears it if none is found.
+// setShadowRef roots p in the current frame's shadow slot, growing refs on
+// demand. slot is relative to the frame's shadow base, which compiled code
+// keeps in execCtx.shadowRefsTop.
+func (c *callEngine) setShadowRef(slot int, p unsafe.Pointer) {
+	i := int(c.execCtx.shadowRefsTop) + slot
+	if i >= len(c.refs) {
+		c.refs = append(c.refs, make([]unsafe.Pointer, i+1-len(c.refs))...)
+	}
+	c.refs[i] = p
+}
+
+// resetShadowRefs drops the roots of a finished call so its exceptions are
+// collectable, and rewinds the shadow stack for the next one.
+func (c *callEngine) resetShadowRefs() {
+	clear(c.refs)
+	c.execCtx.shadowRefsTop = 0
+}
+
 func (c *callEngine) restoreLocalsSaveAreaPtr(from int) {
 	for i := from; i >= 0; i-- {
 		if sa := c.tryHandlers[i].localsSaveArea; len(sa) > 0 {

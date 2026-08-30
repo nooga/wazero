@@ -715,6 +715,11 @@ func (m *ModuleInstance) buildGlobals(module *Module, funcRefResolver func(funcI
 		m.Globals[i+module.ImportGlobalCount] = g
 		g.Type = gs.Type
 		g.initialize(importedGlobals, &gs.Init, funcRefResolver)
+		if IsShadowedRef(gs.Type.ValType) {
+			// A const expr can only produce ref.null exn, so the slot starts
+			// nil; it exists so global.set has somewhere to root a value.
+			m.globalRefSlot(i + module.ImportGlobalCount)
+		}
 	}
 }
 
@@ -1313,6 +1318,14 @@ func ValueTypeName(t ValueType) string {
 
 func isReferenceValueType(vt ValueType) bool {
 	return vt.IsRef()
+}
+
+// IsShadowedRef reports whether a value of type vt carries a Go pointer that
+// the engines must keep visible to Go's collector, because wasm holds it as an
+// opaque uint64. Only exnref does today: it is a *Exception. Funcrefs and
+// externrefs are not Go-allocated objects wazero owns, abstract or concrete.
+func IsShadowedRef(vt ValueType) bool {
+	return vt.Kind() == ValueTypeExnref.Kind()
 }
 
 // isRefSubtypeOf returns true if actual is a subtype of (or equal to) expected.

@@ -159,6 +159,18 @@ func (o operationKind) String() (ret string) {
 		ret = "Pick"
 	case operationKindSet:
 		ret = "Swap"
+	case operationKindPickRef:
+		ret = "PickRef"
+	case operationKindSetRef:
+		ret = "SetRef"
+	case operationKindDropRef:
+		ret = "DropRef"
+	case operationKindSelectRef:
+		ret = "SelectRef"
+	case operationKindBrIfRef:
+		ret = "BrIfRef"
+	case operationKindBrTableRef:
+		ret = "BrTableRef"
 	case operationKindGlobalGet:
 		ret = "GlobalGet"
 	case operationKindGlobalSet:
@@ -807,6 +819,25 @@ const (
 	// operationKindBrOnNonNull is the Kind for br_on_non_null instruction.
 	operationKindBrOnNonNull
 
+	// The following are the shadow-stack variants of the stack-manipulating
+	// kinds above. They behave identically, and additionally keep the
+	// engine's shadow ref stack in step. The compiler emits them only in
+	// functions where a shadowed reference can flow, so functions that
+	// never see one execute exactly the code they did before.
+
+	// operationKindPickRef is the Kind for newOperationPickRef.
+	operationKindPickRef
+	// operationKindSetRef is the Kind for newOperationSetRef.
+	operationKindSetRef
+	// operationKindDropRef is the Kind for newOperationDropRef.
+	operationKindDropRef
+	// operationKindSelectRef is the Kind for newOperationSelectRef.
+	operationKindSelectRef
+	// operationKindBrIfRef is the Kind for newOperationBrIfRef.
+	operationKindBrIfRef
+	// operationKindBrTableRef is the Kind for newOperationBrTableRef.
+	operationKindBrTableRef
+
 	// operationKindEnd is always placed at the bottom of this iota definition to be used in the test.
 	operationKindEnd
 )
@@ -903,6 +934,7 @@ func (o unionOperation) String() string {
 	switch o.Kind {
 	case operationKindUnreachable,
 		operationKindSelect,
+		operationKindSelectRef,
 		operationKindMemorySize,
 		operationKindMemoryGrow,
 		operationKindI32WrapFromI64,
@@ -944,12 +976,12 @@ func (o unionOperation) String() string {
 	case operationKindBr:
 		return fmt.Sprintf("%s %s", o.Kind, label(o.U1).String())
 
-	case operationKindBrIf:
+	case operationKindBrIf, operationKindBrIfRef:
 		thenTarget := label(o.U1)
 		elseTarget := label(o.U2)
 		return fmt.Sprintf("%s %s, %s", o.Kind, thenTarget, elseTarget)
 
-	case operationKindBrTable:
+	case operationKindBrTable, operationKindBrTableRef:
 		var targets []string
 		var defaultLabel label
 		if len(o.Us) > 0 {
@@ -964,12 +996,12 @@ func (o unionOperation) String() string {
 	case operationKindCallIndirect:
 		return fmt.Sprintf("%s: type=%d, table=%d", o.Kind, o.U1, o.U2)
 
-	case operationKindDrop:
+	case operationKindDrop, operationKindDropRef:
 		start := int64(o.U1)
 		end := int64(o.U2)
 		return fmt.Sprintf("%s %d..%d", o.Kind, start, end)
 
-	case operationKindPick, operationKindSet:
+	case operationKindPick, operationKindSet, operationKindPickRef, operationKindSetRef:
 		return fmt.Sprintf("%s %d (is_vector=%v)", o.Kind, o.U1, o.B3)
 
 	case operationKindLoad, operationKindStore:
@@ -1311,6 +1343,64 @@ func newOperationPick(depth int, isTargetVector bool) unionOperation {
 // If isTargetVector=true, this points the location of the lower 64-bits of the vector.
 func newOperationSet(depth int, isTargetVector bool) unionOperation {
 	return unionOperation{Kind: operationKindSet, U1: uint64(depth), B3: isTargetVector}
+}
+
+// newOperationPickRef is a constructor for unionOperation with operationKindPickRef.
+//
+// The engines are expected to behave as newOperationPick, and additionally copy
+// the shadow ref stack entry of the picked value, so a reference stays rooted.
+//
+// depth is the location of the pick target in the uint64 value stack at runtime.
+func newOperationPickRef(depth int) unionOperation {
+	return unionOperation{Kind: operationKindPickRef, U1: uint64(depth)}
+}
+
+// newOperationSetRef is a constructor for unionOperation with operationKindSetRef.
+//
+// The engines are expected to behave as newOperationSet, and additionally move
+// the shadow ref stack entry of the top value to depth.
+//
+// depth is the location of the set target in the uint64 value stack at runtime.
+func newOperationSetRef(depth int) unionOperation {
+	return unionOperation{Kind: operationKindSetRef, U1: uint64(depth)}
+}
+
+// newOperationDropRef is a constructor for unionOperation with operationKindDropRef.
+//
+// The engines are expected to behave as newOperationDrop, and additionally shift
+// the shadow ref stack entries of the values kept above the dropped range.
+//
+// depth spans across the uint64 value stack at runtime to be dropped by this operation.
+func newOperationDropRef(depth inclusiveRange) unionOperation {
+	return unionOperation{Kind: operationKindDropRef, U1: depth.AsU64()}
+}
+
+// newOperationSelectRef is a constructor for unionOperation with operationKindSelectRef.
+//
+// This corresponds to wasm.OpcodeTypedSelect on a shadowed reference type.
+//
+// The engines are expected to behave as newOperationSelect for a non-vector
+// target, and additionally keep the shadow ref stack entry of the selected value.
+func newOperationSelectRef() unionOperation {
+	return unionOperation{Kind: operationKindSelectRef}
+}
+
+// newOperationBrIfRef is a constructor for unionOperation with operationKindBrIfRef.
+//
+// The engines are expected to behave as newOperationBrIf, with the drop
+// performed as newOperationDropRef.
+func newOperationBrIfRef(thenTarget, elseTarget label, thenDrop inclusiveRange) unionOperation {
+	op := newOperationBrIf(thenTarget, elseTarget, thenDrop)
+	op.Kind = operationKindBrIfRef
+	return op
+}
+
+// newOperationBrTableRef is a constructor for unionOperation with operationKindBrTableRef.
+//
+// The engines are expected to behave as newOperationBrTable, with the drops
+// performed as newOperationDropRef.
+func newOperationBrTableRef(targetLabelsAndRanges []uint64) unionOperation {
+	return unionOperation{Kind: operationKindBrTableRef, Us: targetLabelsAndRanges}
 }
 
 // NewOperationGlobalGet is a constructor for unionOperation with operationKindGlobalGet.

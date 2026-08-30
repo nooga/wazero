@@ -49,6 +49,12 @@ const (
 	// ExitCodeTryTableLeave is an exit code for leaving a try_table block.
 	// The dispatch loop pops the most recent try handler.
 	ExitCodeTryTableLeave
+	// ExitCodeShadowStore roots a reference for Go's collector: Go writes
+	// callEngine.refs[slot] = ptr, where slot is relative to the current
+	// frame's shadow base. Compiled code holds references as opaque
+	// integers, which Go's GC cannot see, so every one that enters a frame
+	// is written to a shadow slot that keeps it alive.
+	ExitCodeShadowStore
 	exitCodeMax
 )
 
@@ -113,6 +119,8 @@ func (e ExitCode) String() string {
 		return "null_reference"
 	case ExitCodeTryTableEnter:
 		return "try_table_enter"
+	case ExitCodeShadowStore:
+		return "shadow_store"
 	case ExitCodeTryTableLeave:
 		return "try_table_leave"
 	}
