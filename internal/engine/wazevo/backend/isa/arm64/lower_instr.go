@@ -795,6 +795,12 @@ func (m *machine) LowerInstr(instr *ssa.Instruction) {
 		instr.asDMB()
 		m.insert(instr)
 
+	case ssa.OpcodeShadowFrameEnter:
+		m.lowerShadowFrame(m.compiler.VRegOf(instr.ShadowFrameCtx()), aluOpAdd)
+
+	case ssa.OpcodeShadowFrameLeave:
+		m.lowerShadowFrame(m.compiler.VRegOf(instr.ShadowFrameCtx()), aluOpSub)
+
 	case ssa.OpcodeTailCallReturnCall, ssa.OpcodeTailCallReturnCallIndirect:
 		m.lowerTailCall(instr)
 
@@ -2266,4 +2272,39 @@ func (m *machine) copyToTmp(v regalloc.VReg) regalloc.VReg {
 	}
 	m.insert(mov)
 	return tmp
+}
+
+// lowerShadowFrame reserves (aluOpAdd) or releases (aluOpSub) this function's
+// shadow slots by adjusting execCtx.shadowRefsTop. The slot count is not an
+// immediate on the instruction: the frontend only knows it once the whole body
+// is lowered, so it is read from the builder here. A function that holds no
+// reference reserves nothing and emits no code at all.
+func (m *machine) lowerShadowFrame(execCtxVReg regalloc.VReg, op aluOp) {
+	n := m.compiler.SSABuilder().ShadowFrameSize()
+	if n == 0 {
+		return
+	}
+
+	amode := m.amodePool.Allocate()
+	*amode = addressMode{
+		kind: addressModeKindRegUnsignedImm12,
+		rn:   execCtxVReg, imm: wazevoapi.ExecutionContextOffsetShadowRefsTop.I64(),
+	}
+
+	tmp := m.compiler.AllocateVReg(ssa.TypeI64)
+	ldr := m.allocateInstr()
+	ldr.asULoad(tmp, amode, 64)
+	m.insert(ldr)
+
+	imm12, ok := asImm12Operand(uint64(n))
+	if !ok {
+		panic("BUG: shadow frame size must fit in imm12")
+	}
+	alu := m.allocateInstr()
+	alu.asALU(op, tmp, operandNR(tmp), imm12, true)
+	m.insert(alu)
+
+	str := m.allocateInstr()
+	str.asStore(operandNR(tmp), amode, 64)
+	m.insert(str)
 }

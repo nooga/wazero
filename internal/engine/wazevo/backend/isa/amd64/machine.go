@@ -1129,6 +1129,12 @@ func (m *machine) LowerInstr(instr *ssa.Instruction) {
 	case ssa.OpcodeFence:
 		m.insert(m.allocateInstr().asMFence())
 
+	case ssa.OpcodeShadowFrameEnter:
+		m.lowerShadowFrame(m.c.VRegOf(instr.ShadowFrameCtx()), aluRmiROpcodeAdd)
+
+	case ssa.OpcodeShadowFrameLeave:
+		m.lowerShadowFrame(m.c.VRegOf(instr.ShadowFrameCtx()), aluRmiROpcodeSub)
+
 	case ssa.OpcodeAtomicStore:
 		ptr, _val := instr.Arg2()
 		size := instr.AtomicTargetSize()
@@ -3857,4 +3863,23 @@ func (m *machine) lowerVFabs(instr *ssa.Instruction) {
 	}
 
 	m.copyTo(tmp, rd)
+}
+
+// lowerShadowFrame reserves (aluRmiROpcodeAdd) or releases (aluRmiROpcodeSub)
+// this function's shadow slots by adjusting execCtx.shadowRefsTop. The slot
+// count is not an immediate on the instruction: the frontend only knows it once
+// the whole body is lowered, so it is read from the builder here. A function
+// that holds no reference reserves nothing and emits no code at all.
+func (m *machine) lowerShadowFrame(execCtx regalloc.VReg, op aluRmiROpcode) {
+	n := m.c.SSABuilder().ShadowFrameSize()
+	if n == 0 {
+		return
+	}
+
+	mem := newOperandMem(m.newAmodeImmReg(wazevoapi.ExecutionContextOffsetShadowRefsTop.U32(), execCtx))
+
+	tmp := m.c.AllocateVReg(ssa.TypeI64)
+	m.insert(m.allocateInstr().asMov64MR(mem, tmp))
+	m.insert(m.allocateInstr().asAluRmiR(op, newOperandImm32(uint32(n)), tmp, true))
+	m.insert(m.allocateInstr().asMovRM(tmp, mem, 8))
 }

@@ -75,6 +75,19 @@ type Compiler struct {
 	// throwSig is the signature for the throw/throw_ref trampoline:
 	// (execCtx, exnref) → (). Searches for a matching handler and restores.
 	throwSig ssa.Signature
+	// shadowStoreSig is the signature for the shadow-store trampoline:
+	// (execCtx, slot, ptr) -> (). Roots ptr in this frame's shadow slot.
+	shadowStoreSig ssa.Signature
+	// shadowSlots counts the shadow slots this function reserves. Assigned
+	// as sites are lowered; the total reaches the backend through
+	// ssa.Builder.SetShadowFrameSize.
+	shadowSlots int
+	// exnrefLocalSlot maps a wasm local index to its shadow slot, for the
+	// exnref-typed locals only. -1 means the local holds no reference.
+	exnrefLocalSlot []int
+	// needsShadowFrame gates every shadow-frame instruction, so that a
+	// function which can hold no reference compiles exactly as before.
+	needsShadowFrame bool
 	// tryTableEnterSig is the signature for the try_table enter trampoline.
 	tryTableEnterSig ssa.Signature
 	// tryTableLeaveSig is the signature for the try_table leave trampoline.
@@ -314,6 +327,12 @@ func (c *Compiler) declareSignatures(listenerOn bool) {
 		Params: []ssa.Type{ssa.TypeI64, ssa.TypeI64},
 	}
 	c.ssaBuilder.DeclareSignature(&c.memclrSig)
+	c.shadowStoreSig = ssa.Signature{
+		ID:      c.memclrSig.ID + 1,
+		Params:  []ssa.Type{ssa.TypeI64 /* exec context */, ssa.TypeI64 /* slot */, ssa.TypeI64 /* ptr */},
+		Results: []ssa.Type{},
+	}
+	c.ssaBuilder.DeclareSignature(&c.shadowStoreSig)
 }
 
 // SignatureForWasmFunctionType returns the ssa.Signature for the given wasm.FunctionType.
@@ -399,8 +418,127 @@ func (c *Compiler) LowerToSSA() {
 	}
 	c.declareWasmLocals()
 	c.declareNecessaryVariables()
+	c.declareShadowSlots()
+
+	if c.needsShadowFrame {
+		// Reserve this frame's shadow slots. The count is not an operand: it
+		// is only final once the body is lowered, so the backend reads it
+		// from the builder.
+		builder.InsertInstruction(builder.AllocateInstruction().AsShadowFrameEnter(c.execCtxPtrValue))
+		// Only now do the slots belong to this frame, so params root after it.
+		c.rootParams()
+	}
 
 	c.lowerBody(entryBlock)
+
+	if c.needsShadowFrame {
+		// The gate over-approximates, so a frame may turn out to hold no
+		// slots. Keep at least one, so that the frame instructions the body
+		// already carries always adjust by a non-zero amount.
+		builder.SetShadowFrameSize(max(c.shadowSlots, 1))
+	}
+}
+
+// declareShadowSlots assigns a shadow slot to every exnref-typed param and
+// local. These are the locations that can hold a reference across a point
+// where another one is produced, which is the two-live-exceptions shape of
+// wazero/wazero#2522.
+func (c *Compiler) declareShadowSlots() {
+	c.shadowSlots = 0
+	params, locals := c.wasmFunctionTyp.Params, c.wasmFunctionLocalTypes
+	c.exnrefLocalSlot = c.exnrefLocalSlot[:0]
+	c.needsShadowFrame = false
+	for i := 0; i < len(params)+len(locals); i++ {
+		var t wasm.ValueType
+		if i < len(params) {
+			t = params[i]
+		} else {
+			t = locals[i-len(params)]
+		}
+		slot := -1
+		if wasm.IsShadowedRef(t) {
+			slot = c.allocShadowSlot()
+		}
+		c.exnrefLocalSlot = append(c.exnrefLocalSlot, slot)
+	}
+
+	// A try_table may hand the body an exnref through catch_ref, which needs
+	// a slot the signature does not reveal. Searching for the opcode byte
+	// over-approximates — a v128 shuffle mask or any other immediate can
+	// look like one — but it never misses a real try_table, and a false
+	// positive only costs a frame adjust. Only modules that declare a tag
+	// are searched at all, so a module that does not use exceptions compiles
+	// exactly as before.
+	c.needsShadowFrame = c.shadowSlots > 0 ||
+		(c.m.ImportTagCount > 0 || len(c.m.TagSection) > 0) &&
+			bytes.IndexByte(c.wasmFunctionBody, wasm.OpcodeTryTable) >= 0
+}
+
+// rootParams roots exnref-typed parameters in their own frame. The caller
+// normally holds them rooted for the duration of the call, but a tail call
+// frees the caller's frame, so the callee cannot rely on that.
+func (c *Compiler) rootParams() {
+	for i, t := range c.wasmFunctionTyp.Params {
+		if !wasm.IsShadowedRef(t) {
+			continue
+		}
+		c.emitShadowStore(c.exnrefLocalSlot[i], c.ssaBuilder.MustFindValue(c.localVariable(wasm.Index(i))))
+	}
+}
+
+// allocShadowSlot reserves the next shadow slot in this frame.
+func (c *Compiler) allocShadowSlot() int {
+	s := c.shadowSlots
+	c.shadowSlots++
+	return s
+}
+
+// emitShadowStore roots v in this frame's shadow slot, so Go's collector keeps
+// the object alive while compiled code holds it as an opaque integer.
+func (c *Compiler) emitShadowStore(slot int, v ssa.Value) {
+	builder := c.ssaBuilder
+	ptr := builder.AllocateInstruction().
+		AsLoad(c.execCtxPtrValue,
+			wazevoapi.ExecutionContextOffsetShadowStoreTrampolineAddress.U32(),
+			ssa.TypeI64,
+		).Insert(builder).Return()
+	slotVal := builder.AllocateInstruction().AsIconst64(uint64(slot)).Insert(builder).Return()
+	args := c.allocateVarLengthValues(3, c.execCtxPtrValue, slotVal, v)
+	builder.AllocateInstruction().
+		AsCallIndirect(ptr, &c.shadowStoreSig, args).
+		Insert(builder)
+}
+
+// rootExnRef loads the caught exnref and roots it in a shadow slot of its own.
+// catch_ref and catch_all_ref are where an exception enters the frame: the
+// dispatch loop drops its own reference as soon as the next one is thrown, so
+// without this the guest would be left holding a freed pointer. See
+// wazero/wazero#2522.
+func (c *Compiler) rootExnRef() ssa.Value {
+	v := c.loadExnRef()
+	c.emitShadowStore(c.allocShadowSlot(), v)
+	return v
+}
+
+// rootLocal roots v in the shadow slot of local index, when that local is
+// exnref-typed. A no-op for every other local, so ordinary code is unchanged.
+func (c *Compiler) rootLocal(index uint32, v ssa.Value) {
+	if int(index) >= len(c.exnrefLocalSlot) {
+		return
+	}
+	if slot := c.exnrefLocalSlot[index]; slot >= 0 {
+		c.emitShadowStore(slot, v)
+	}
+}
+
+// emitShadowFrameLeave releases this frame's shadow slots. Emitted before every
+// return and tail call, since a tail call frees the frame too.
+func (c *Compiler) emitShadowFrameLeave() {
+	if !c.needsShadowFrame {
+		return
+	}
+	builder := c.ssaBuilder
+	builder.InsertInstruction(builder.AllocateInstruction().AsShadowFrameLeave(c.execCtxPtrValue))
 }
 
 // localVariable returns the SSA variable for the given Wasm local index.

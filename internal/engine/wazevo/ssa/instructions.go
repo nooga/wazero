@@ -641,6 +641,16 @@ const (
 	// for tail calls. Semantically, it combines CallIndirect + Return into a single operation.
 	OpcodeTailCallReturnCallIndirect
 
+	// OpcodeShadowFrameEnter reserves this function's shadow slots on entry:
+	// `shadow_frame_enter ctx`. The slot count is not an immediate; the
+	// backend reads it from Builder.ShadowFrameSize once lowering is done,
+	// and emits nothing when it is zero.
+	OpcodeShadowFrameEnter
+
+	// OpcodeShadowFrameLeave releases them again before returning:
+	// `shadow_frame_leave ctx`. Mirrors OpcodeShadowFrameEnter.
+	OpcodeShadowFrameLeave
+
 	// opcodeEnd marks the end of the opcode list.
 	opcodeEnd
 )
@@ -886,6 +896,8 @@ var instructionSideEffects = [opcodeEnd]sideEffect{
 	OpcodeAtomicStore:                 sideEffectStrict,
 	OpcodeAtomicCas:                   sideEffectStrict,
 	OpcodeFence:                       sideEffectStrict,
+	OpcodeShadowFrameEnter:            sideEffectStrict,
+	OpcodeShadowFrameLeave:            sideEffectStrict,
 	OpcodeTailCallReturnCall:          sideEffectStrict,
 	OpcodeTailCallReturnCallIndirect:  sideEffectStrict,
 	OpcodeWideningPairwiseDotProductS: sideEffectNone,
@@ -1044,6 +1056,8 @@ var instructionReturnTypes = [opcodeEnd]returnTypesFn{
 	OpcodeAtomicStore:                 returnTypesFnNoReturns,
 	OpcodeAtomicCas:                   returnTypesFnSingle,
 	OpcodeFence:                       returnTypesFnNoReturns,
+	OpcodeShadowFrameEnter:            returnTypesFnNoReturns,
+	OpcodeShadowFrameLeave:            returnTypesFnNoReturns,
 	OpcodeTailCallReturnCallIndirect:  returnTypesFnCallIndirect,
 	OpcodeTailCallReturnCall:          returnTypesFnCall,
 	OpcodeWideningPairwiseDotProductS: returnTypesFnV128,
@@ -2042,6 +2056,29 @@ func (i *Instruction) AsFence(order byte) *Instruction {
 	return i
 }
 
+// AsShadowFrameEnter initializes this instruction as the shadow-frame reserve
+// on function entry. ctx is the execution context pointer; the slot count comes
+// from Builder.ShadowFrameSize at lowering time, since it is only final once
+// the whole body has been lowered.
+func (i *Instruction) AsShadowFrameEnter(ctx Value) *Instruction {
+	i.opcode = OpcodeShadowFrameEnter
+	i.v = ctx
+	return i
+}
+
+// AsShadowFrameLeave initializes this instruction as the matching release.
+func (i *Instruction) AsShadowFrameLeave(ctx Value) *Instruction {
+	i.opcode = OpcodeShadowFrameLeave
+	i.v = ctx
+	return i
+}
+
+// ShadowFrameCtx returns the execution context operand of
+// OpcodeShadowFrameEnter / OpcodeShadowFrameLeave.
+func (i *Instruction) ShadowFrameCtx() Value {
+	return i.v
+}
+
 // AtomicRmwData returns the data for this atomic read-modify-write instruction.
 func (i *Instruction) AtomicRmwData() (op AtomicRmwOp, size uint64) {
 	return AtomicRmwOp(i.u1), i.u2
@@ -2653,6 +2690,8 @@ func (i *Instruction) Format(b Builder) string {
 		instSuffix = fmt.Sprintf("_%d, %s, %s, %s", 8*i.u1, i.v.Format(b), i.v2.Format(b), i.v3.Format(b))
 	case OpcodeFence:
 		instSuffix = fmt.Sprintf(" %d", i.u1)
+	case OpcodeShadowFrameEnter, OpcodeShadowFrameLeave:
+		instSuffix = " " + i.v.Format(b)
 	case OpcodeTailCallReturnCall, OpcodeTailCallReturnCallIndirect:
 		view := i.vs.View()
 		vs := make([]string, len(view))
@@ -2923,6 +2962,10 @@ func (o Opcode) String() (ret string) {
 		return "AtomicStore"
 	case OpcodeFence:
 		return "Fence"
+	case OpcodeShadowFrameEnter:
+		return "ShadowFrameEnter"
+	case OpcodeShadowFrameLeave:
+		return "ShadowFrameLeave"
 	case OpcodeTailCallReturnCall:
 		return "ReturnCall"
 	case OpcodeTailCallReturnCallIndirect:

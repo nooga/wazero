@@ -2661,6 +2661,8 @@ func TestCompiler_declareSignatures(t *testing.T) {
 			{ID: 15, Params: []ssa.Type{ssa.TypeI64}},
 			// memclr signature.
 			{ID: 16, Params: []ssa.Type{ssa.TypeI64, ssa.TypeI64}},
+			// shadow-store signature.
+			{ID: 17, Params: []ssa.Type{ssa.TypeI64, ssa.TypeI64, ssa.TypeI64}},
 		}
 
 		require.Equal(t, len(expected), len(declaredSigs))
@@ -2707,6 +2709,8 @@ func TestCompiler_declareSignatures(t *testing.T) {
 			{ID: 23, Params: []ssa.Type{ssa.TypeI64}},
 			// memclr signature.
 			{ID: 24, Params: []ssa.Type{ssa.TypeI64, ssa.TypeI64}},
+			// shadow-store signature.
+			{ID: 25, Params: []ssa.Type{ssa.TypeI64, ssa.TypeI64, ssa.TypeI64}},
 		}
 		require.Equal(t, len(expected), len(declaredSigs))
 		for i := 0; i < len(declaredSigs); i++ {

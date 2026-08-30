@@ -65,6 +65,15 @@ type Builder interface {
 	// AnnotateValue is for debugging purpose.
 	AnnotateValue(value Value, annotation string)
 
+	// SetShadowFrameSize records how many shadow slots this function reserves.
+	// The frontend knows this only once the whole body has been lowered, so
+	// OpcodeShadowFrameEnter/Leave carry no immediate and the backend reads it
+	// from here instead.
+	SetShadowFrameSize(n int)
+
+	// ShadowFrameSize returns the value set by SetShadowFrameSize.
+	ShadowFrameSize() int
+
 	// DeclareSignature appends the *Signature to be referenced by various instructions (e.g. OpcodeCall).
 	DeclareSignature(signature *Signature)
 
@@ -162,6 +171,9 @@ type builder struct {
 	reversePostOrderedBasicBlocks []*basicBlock
 	currentBB                     *basicBlock
 	returnBlk                     *basicBlock
+
+	// shadowFrameSize is the number of shadow slots this function reserves.
+	shadowFrameSize int
 
 	// nextValueID is used by builder.AllocateValue.
 	nextValueID ValueID
@@ -269,6 +281,7 @@ func (b *builder) ReturnBlock() BasicBlock {
 // Init implements Builder.Reset.
 func (b *builder) Init(s *Signature) {
 	b.nextVariable = 0
+	b.shadowFrameSize = 0
 	b.currentSignature = s
 	b.zeros = [typeEnd]Value{ValueInvalid, ValueInvalid, ValueInvalid, ValueInvalid, ValueInvalid, ValueInvalid}
 	resetBasicBlock(b.returnBlk)
@@ -788,3 +801,9 @@ func (b *builder) InstructionOfValue(v Value) *Instruction {
 	}
 	return b.instructionsPool.View(instrID - 1)
 }
+
+// SetShadowFrameSize implements Builder.SetShadowFrameSize.
+func (b *builder) SetShadowFrameSize(n int) { b.shadowFrameSize = n }
+
+// ShadowFrameSize implements Builder.ShadowFrameSize.
+func (b *builder) ShadowFrameSize() int { return b.shadowFrameSize }

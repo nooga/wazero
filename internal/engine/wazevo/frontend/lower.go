@@ -1169,6 +1169,7 @@ func (c *Compiler) lowerCurrentOpcode() {
 		if c.tryTableDepth > 0 {
 			c.storeLocalToSaveArea(wasm.Index(index), newValue)
 		}
+		c.rootLocal(index, newValue)
 
 	case wasm.OpcodeLocalTee:
 		index := c.readI32u()
@@ -1181,6 +1182,7 @@ func (c *Compiler) lowerCurrentOpcode() {
 		if c.tryTableDepth > 0 {
 			c.storeLocalToSaveArea(wasm.Index(index), newValue)
 		}
+		c.rootLocal(index, newValue)
 
 	case wasm.OpcodeSelect, wasm.OpcodeTypedSelect:
 		if op == wasm.OpcodeTypedSelect {
@@ -1611,6 +1613,7 @@ func (c *Compiler) lowerCurrentOpcode() {
 
 			c.callListenerAfter()
 
+			c.emitShadowFrameLeave()
 			instr := builder.AllocateInstruction()
 			instr.AsReturn(args)
 			builder.InsertInstruction(instr)
@@ -3698,11 +3701,11 @@ func (c *Compiler) lowerCurrentOpcode() {
 					if tagType := c.resolveTagType(cc.tagIndex); tagType != nil {
 						brArgs = c.loadExceptionParams(tagType)
 					}
-					brArgs = append(brArgs, c.loadExnRef())
+					brArgs = append(brArgs, c.rootExnRef())
 				case wasm.CatchKindCatchAll:
 					// No values.
 				case wasm.CatchKindCatchAllRef:
-					brArgs = append(brArgs, c.loadExnRef())
+					brArgs = append(brArgs, c.rootExnRef())
 				}
 
 				// Pop any enclosing try_table handlers that the jump crosses.
@@ -3833,6 +3836,7 @@ func (c *Compiler) lowerCurrentOpcode() {
 			builder.SetCurrentBlock(targetBlk)
 			sealTargetBlk = true
 			c.callListenerAfter()
+			c.emitShadowFrameLeave()
 			instr := builder.AllocateInstruction()
 			instr.AsReturn(args)
 			builder.InsertInstruction(instr)
@@ -3893,6 +3897,7 @@ func (c *Compiler) lowerCurrentOpcode() {
 			builder.SetCurrentBlock(targetBlk)
 			sealTargetBlk = true
 			c.callListenerAfter()
+			c.emitShadowFrameLeave()
 			instr := builder.AllocateInstruction()
 			instr.AsReturn(args)
 			builder.InsertInstruction(instr)
@@ -3945,6 +3950,7 @@ func (c *Compiler) lowerCurrentOpcode() {
 
 func (c *Compiler) lowerReturn(builder ssa.Builder) {
 	results := c.nPeekDup(c.results())
+	c.emitShadowFrameLeave()
 	instr := builder.AllocateInstruction()
 
 	instr.AsReturn(results)
@@ -4183,6 +4189,9 @@ func (c *Compiler) lowerTailCallReturnCall(fnIndex uint32) {
 	builder := c.ssaBuilder
 	state := c.state()
 
+	// A tail call frees this frame, so release its shadow slots first.
+	c.emitShadowFrameLeave()
+
 	call := builder.AllocateInstruction()
 	if isIndirect {
 		call.AsTailCallReturnCallIndirect(ssa.Value(funcRefOrPtrValue), sig, args)
@@ -4212,6 +4221,9 @@ func (c *Compiler) lowerTailCallReturnCallIndirect(typeIndex, tableIndex uint32)
 	builder := c.ssaBuilder
 	state := c.state()
 	executablePtr, typ, args := c.prepareCallIndirect(typeIndex, tableIndex)
+
+	// A tail call frees this frame, so release its shadow slots first.
+	c.emitShadowFrameLeave()
 
 	call := builder.AllocateInstruction()
 	call.AsTailCallReturnCallIndirect(executablePtr, c.signatures[typ], args)
@@ -4297,6 +4309,9 @@ func (c *Compiler) lowerTailCallReturnCallRef(typeIndex uint32) {
 	builder := c.ssaBuilder
 	state := c.state()
 	executablePtr, typ, args := c.prepareCallRef(typeIndex)
+
+	// A tail call frees this frame, so release its shadow slots first.
+	c.emitShadowFrameLeave()
 
 	call := builder.AllocateInstruction()
 	call.AsTailCallReturnCallIndirect(executablePtr, c.signatures[typ], args)
@@ -4997,6 +5012,9 @@ func (c *Compiler) insertJumpToBlock(args ssa.Values, targetBlk ssa.BasicBlock) 
 		if c.needListener {
 			c.callListenerAfter()
 		}
+		// A jump to the return block is a return: the backend turns it into
+		// one, so this frame's shadow slots are released here too.
+		c.emitShadowFrameLeave()
 	}
 
 	builder := c.ssaBuilder
