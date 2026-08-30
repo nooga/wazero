@@ -392,3 +392,18 @@ func (dst *TableInstance) CopyRefs(dstOff uint32, src *TableInstance, srcOff, n 
 	}
 	copy(dst.Refs[dstOff:dstOff+n], src.Refs[srcOff:srcOff+n])
 }
+
+// SyncRefs rebuilds Refs from References. For a reference-typed table the
+// element is the Go pointer, so this recovers what the collector must see
+// after a write it could not observe. Only sound while the objects are still
+// alive, so call it right after the write that stored them.
+func (t *TableInstance) SyncRefs() {
+	if t.Refs == nil {
+		t.Refs = make([]unsafe.Pointer, len(t.References))
+	} else if len(t.Refs) != len(t.References) {
+		t.Refs = append(t.Refs, make([]unsafe.Pointer, len(t.References)-len(t.Refs))...)
+	}
+	for i := range t.References {
+		t.Refs[i] = *(*unsafe.Pointer)(unsafe.Pointer(&t.References[i]))
+	}
+}

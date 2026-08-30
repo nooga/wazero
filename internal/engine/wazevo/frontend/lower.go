@@ -595,6 +595,7 @@ func (c *Compiler) lowerCurrentOpcode() {
 				AsCallIndirect(tableGrowPtr, &c.tableGrowSig, args).
 				Insert(builder).Return()
 			state.push(callGrowRet)
+			c.syncTableRefs(tableIndex)
 
 		case wasm.OpcodeMiscTableCopy:
 			dstTableIndex := c.readI32u()
@@ -626,6 +627,8 @@ func (c *Compiler) lowerCurrentOpcode() {
 
 			copySizeInBytes := builder.AllocateInstruction().AsIshl(copySize, three).Insert(builder).Return()
 			c.callMemmove(dstAddr, srcAddr, copySizeInBytes)
+
+			c.syncTableRefs(dstTableIndex)
 
 		case wasm.OpcodeMiscMemoryCopy:
 			state.pc += 2 // +2 to skip two memory indexes which are fixed to zero.
@@ -726,6 +729,8 @@ func (c *Compiler) lowerCurrentOpcode() {
 			builder.Seal(beforeLoop)
 			builder.Seal(loopBlk)
 			builder.Seal(followingBlk)
+
+			c.syncTableRefs(tableIndex)
 
 		case wasm.OpcodeMiscMemoryFill:
 			state.pc++ // Skip the memory index which is fixed to zero.
@@ -930,6 +935,8 @@ func (c *Compiler) lowerCurrentOpcode() {
 
 			copySizeInBytes := builder.AllocateInstruction().AsIshl(copySize, three).Insert(builder).Return()
 			c.callMemmove(dstAddr, srcAddr, copySizeInBytes)
+
+			c.syncTableRefs(tableIndex)
 
 		case wasm.OpcodeMiscElemDrop:
 			index := c.readI32u()
@@ -3501,6 +3508,7 @@ func (c *Compiler) lowerCurrentOpcode() {
 
 		elementAddr := c.lowerAccessTableWithBoundsCheck(tableIndex, targetOffsetInTable)
 		builder.AllocateInstruction().AsStore(ssa.OpcodeStore, r, elementAddr, 0).Insert(builder)
+		c.syncTableRefs(tableIndex)
 
 	case wasm.OpcodeTableGet:
 		tableIndex := c.readI32u()

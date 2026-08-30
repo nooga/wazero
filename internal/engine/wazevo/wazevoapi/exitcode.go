@@ -61,6 +61,12 @@ const (
 	// the side table is what keeps the object alive once the frame that
 	// produced it is gone.
 	ExitCodeGlobalRefStore
+	// ExitCodeTableRefSync rebuilds a table's Refs side table from its
+	// elements. For a reference-typed table the element is the pointer, so
+	// Go can recover it as long as the object is still alive, which it is
+	// immediately after the write that prompted the sync. One exit covers
+	// table.set and every bulk write; only reference-typed tables use it.
+	ExitCodeTableRefSync
 	exitCodeMax
 )
 
@@ -129,6 +135,8 @@ func (e ExitCode) String() string {
 		return "shadow_store"
 	case ExitCodeGlobalRefStore:
 		return "global_ref_store"
+	case ExitCodeTableRefSync:
+		return "table_ref_sync"
 	case ExitCodeTryTableLeave:
 		return "try_table_leave"
 	}

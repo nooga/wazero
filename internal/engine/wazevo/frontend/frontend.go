@@ -84,6 +84,9 @@ type Compiler struct {
 	// globalRefStoreSig is the signature for the global-ref-store trampoline:
 	// (execCtx, globalIndex, ptr) -> ().
 	globalRefStoreSig ssa.Signature
+	// tableRefSyncSig is the signature for the table-ref-sync trampoline:
+	// (execCtx, tableIndex) -> ().
+	tableRefSyncSig ssa.Signature
 	// shadowSlots counts the shadow slots this function reserves. Assigned
 	// as sites are lowered; the total reaches the backend through
 	// ssa.Builder.SetShadowFrameSize.
@@ -346,6 +349,13 @@ func (c *Compiler) declareSignatures(listenerOn bool) {
 		Results: []ssa.Type{},
 	}
 	c.ssaBuilder.DeclareSignature(&c.globalRefStoreSig)
+
+	c.tableRefSyncSig = ssa.Signature{
+		ID:      c.globalRefStoreSig.ID + 1,
+		Params:  []ssa.Type{ssa.TypeI64 /* exec context */, ssa.TypeI64 /* table index */},
+		Results: []ssa.Type{},
+	}
+	c.ssaBuilder.DeclareSignature(&c.tableRefSyncSig)
 }
 
 // SignatureForWasmFunctionType returns the ssa.Signature for the given wasm.FunctionType.
@@ -573,6 +583,29 @@ func (c *Compiler) rootGlobal(index wasm.Index, v ssa.Value) {
 	builder.AllocateInstruction().
 		AsCallIndirect(ptr, &c.globalRefStoreSig, args).
 		Insert(builder)
+}
+
+// syncTableRefs has Go rebuild the table's side table after a write compiled
+// code just made. Table elements live in memory Go does not scan, so this is
+// what keeps a reference stored there alive. Emitted only for
+// reference-typed tables, which leaves every ordinary table untouched.
+func (c *Compiler) syncTableRefs(index wasm.Index) {
+	if !c.tableShadowed(index) {
+		return
+	}
+	builder := c.ssaBuilder
+	c.storeCallerModuleContext()
+	ptr := builder.AllocateInstruction().
+		AsLoad(c.execCtxPtrValue,
+			wazevoapi.ExecutionContextOffsetTableRefSyncTrampolineAddress.U32(),
+			ssa.TypeI64,
+		).Insert(builder).Return()
+	idx := builder.AllocateInstruction().AsIconst64(uint64(index)).Insert(builder).Return()
+	args := c.allocateVarLengthValues(2, c.execCtxPtrValue, idx)
+	builder.AllocateInstruction().
+		AsCallIndirect(ptr, &c.tableRefSyncSig, args).
+		Insert(builder)
+	c.reloadAfterCall()
 }
 
 // rootIfShadowed roots v in a fresh slot when t is a reference type, and

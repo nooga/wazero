@@ -10,6 +10,7 @@
   (tag $a (param i32))
   (tag $b)
   (global $ge (mut exnref) (ref.null exn))
+  (table $te 4 exnref)
 
   ;; throw_b overwrites the engine's most-recent-exception slot with B.
   (func $throw_b
@@ -61,6 +62,21 @@
     (call $scrub)
     (call $churn)
     (call $rethrow (local.get $x)))
+
+  ;; stash_table parks A in a table and returns, so only the table can be
+  ;; keeping it alive. Table elements live in memory Go does not scan.
+  (func $stash_table
+    (i32.const 2)
+    (block $h (result exnref)
+      (try_table (catch_all_ref $h) (throw $a (i32.const 17)))
+      (unreachable))
+    (table.set $te))
+
+  (func (export "exnref_table") (result i32)
+    (call $stash_table)
+    (call $scrub)
+    (call $churn)
+    (call $rethrow (table.get $te (i32.const 2))))
 
   ;; scrub catches many exceptions into locals, so any slot a returned frame
   ;; left behind is overwritten. Without it a stale slot can still be holding

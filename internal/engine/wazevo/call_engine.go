@@ -182,6 +182,9 @@ type (
 		// globalRefStoreTrampolineAddress holds the address of the
 		// global-ref-store trampoline function.
 		globalRefStoreTrampolineAddress *byte
+		// tableRefSyncTrampolineAddress holds the address of the
+		// table-ref-sync trampoline function.
+		tableRefSyncTrampolineAddress *byte
 	}
 )
 
@@ -420,6 +423,7 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 			tableIndex, num, ref := uint32(s[0]), uint32(s[1]), uintptr(s[2])
 			table := mod.Tables[tableIndex]
 			s[0] = uint64(uint32(int32(table.Grow(num, ref))))
+			table.SyncRefs()
 			c.execCtx.exitCode = wazevoapi.ExitCodeOK
 			afterGoFunctionCallEntrypoint(c.execCtx.goCallReturnAddress, c.execCtxPtr,
 				uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall)), c.execCtx.framePointerBeforeGoCall)
@@ -657,6 +661,13 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 			// Global ref store: (execCtx, globalIndex, ptr) -> ().
 			s := goCallStackView(c.execCtx.stackPointerBeforeGoCall)
 			c.callerModuleInstance().SetGlobalRef(wasm.Index(s[0]), *(*unsafe.Pointer)(unsafe.Pointer(&s[1])))
+			c.execCtx.exitCode = wazevoapi.ExitCodeOK
+			afterGoFunctionCallEntrypoint(c.execCtx.goCallReturnAddress, c.execCtxPtr,
+				uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall)), c.execCtx.framePointerBeforeGoCall)
+		case wazevoapi.ExitCodeTableRefSync:
+			// Table ref sync: (execCtx, tableIndex) -> ().
+			s := goCallStackView(c.execCtx.stackPointerBeforeGoCall)
+			c.callerModuleInstance().Tables[uint32(s[0])].SyncRefs()
 			c.execCtx.exitCode = wazevoapi.ExitCodeOK
 			afterGoFunctionCallEntrypoint(c.execCtx.goCallReturnAddress, c.execCtxPtr,
 				uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall)), c.execCtx.framePointerBeforeGoCall)

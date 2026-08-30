@@ -82,7 +82,10 @@ type (
 		// globalRefStoreAddress is the address of the global-ref-store
 		// trampoline, which roots a reference a global now holds.
 		globalRefStoreAddress *byte
-		listenerTrampolines   listenerTrampolines
+		// tableRefSyncAddress is the address of the table-ref-sync
+		// trampoline, which rebuilds a table's Refs side table.
+		tableRefSyncAddress *byte
+		listenerTrampolines listenerTrampolines
 	}
 
 	listenerTrampolines = map[*wasm.FunctionType]struct {
@@ -759,7 +762,7 @@ func (e *engine) NewModuleEngine(m *wasm.Module, mi *wasm.ModuleInstance) (wasm.
 }
 
 func (e *engine) compileSharedFunctions() {
-	var sizes [14]int
+	var sizes [15]int
 	var trampolines []byte
 
 	addTrampoline := func(i int, buf []byte) {
@@ -875,6 +878,14 @@ func (e *engine) compileSharedFunctions() {
 			Results: []ssa.Type{},
 		}, false))
 
+	e.be.Init()
+	addTrampoline(14,
+		e.machine.CompileGoFunctionTrampoline(wazevoapi.ExitCodeTableRefSync, &ssa.Signature{
+			// exec context, table index
+			Params:  []ssa.Type{ssa.TypeI64, ssa.TypeI64},
+			Results: []ssa.Type{},
+		}, false))
+
 	fns := &sharedFunctions{
 		executable:          mmapExecutable(trampolines),
 		listenerTrampolines: make(listenerTrampolines),
@@ -909,6 +920,8 @@ func (e *engine) compileSharedFunctions() {
 	fns.shadowStoreAddress = &fns.executable[offset]
 	offset += sizes[12]
 	fns.globalRefStoreAddress = &fns.executable[offset]
+	offset += sizes[13]
+	fns.tableRefSyncAddress = &fns.executable[offset]
 
 	if wazevoapi.PerfMapEnabled {
 		wazevoapi.PerfMap.AddEntry(uintptr(unsafe.Pointer(fns.memoryGrowAddress)), uint64(sizes[0]), "memory_grow_trampoline")
@@ -925,6 +938,7 @@ func (e *engine) compileSharedFunctions() {
 		wazevoapi.PerfMap.AddEntry(uintptr(unsafe.Pointer(fns.tryTableLeaveAddress)), uint64(sizes[11]), "try_table_leave_trampoline")
 		wazevoapi.PerfMap.AddEntry(uintptr(unsafe.Pointer(fns.shadowStoreAddress)), uint64(sizes[12]), "shadow_store_trampoline")
 		wazevoapi.PerfMap.AddEntry(uintptr(unsafe.Pointer(fns.globalRefStoreAddress)), uint64(sizes[13]), "global_ref_store_trampoline")
+		wazevoapi.PerfMap.AddEntry(uintptr(unsafe.Pointer(fns.tableRefSyncAddress)), uint64(sizes[14]), "table_ref_sync_trampoline")
 	}
 
 	e.sharedFunctions = fns
