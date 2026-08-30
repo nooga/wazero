@@ -71,6 +71,7 @@ func runExnrefLivenessTests(t *testing.T, cfg wazero.RuntimeConfig) {
 		{"exnref_local", 13},
 		{"exnref_global", 14},
 		{"exnref_global_cross_call", 15},
+		{"exnref_unwind", 16},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()

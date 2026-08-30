@@ -91,6 +91,11 @@ type (
 		// Used for tag matching in doHandleException (the tag index in
 		// catch clauses is relative to this module's tag index space).
 		moduleInstance *wasm.ModuleInstance
+		// shadowRefsTop is the shadow stack depth at the try_table entry.
+		// An unwind skips the epilogues of every frame it passes through, so
+		// none of them release their slots; restoring this puts the handler's
+		// slots back at the base its own frame was compiled against.
+		shadowRefsTop uintptr
 	}
 
 	// executionContext is the struct to be read/written by assembly functions.
@@ -690,6 +695,7 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 				catchClauses:   info.CatchClauses,
 				moduleInstance: mod,
 				localsSaveArea: saveArea,
+				shadowRefsTop:  c.execCtx.shadowRefsTop,
 			})
 			// Set clauseIdx = -1 (no exception) in execCtx for the compiled code
 			// to read after the trampoline returns.
@@ -742,6 +748,10 @@ func (c *callEngine) doHandleException(exn *wasm.Exception) bool {
 
 				// Store the caught exception so handler code can read params.
 				c.pendingException = exn
+
+				// Frames unwound by the raise never ran their epilogues, so
+				// the shadow stack is still as deep as it was at the throw.
+				c.execCtx.shadowRefsTop = h.shadowRefsTop
 
 				// Restore the cloned stack (like snapshot.doRestore).
 				spp := *(**uint64)(unsafe.Pointer(&h.sp))

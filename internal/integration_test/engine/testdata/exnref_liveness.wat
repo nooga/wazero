@@ -40,6 +40,28 @@
       (unreachable))
     (global.set $ge))
 
+  ;; deep throws from a nested frame, so the catch below unwinds frames whose
+  ;; epilogues never run and whose shadow slots are therefore never released.
+  (func $deep (param $d i32)
+    (if (i32.gt_u (local.get $d) (i32.const 0))
+      (then (call $deep (i32.sub (local.get $d) (i32.const 1)))))
+    (throw $b))
+
+  ;; A is caught and parked in a local, then a second exception is raised from
+  ;; several frames down and caught here. The unwind must not move the base
+  ;; this frame's slots are addressed from, or $x stops being rooted.
+  (func (export "exnref_unwind") (result i32)
+    (local $x exnref)
+    (block $h (result exnref)
+      (try_table (catch_all_ref $h) (throw $a (i32.const 16)))
+      (unreachable))
+    (local.set $x)
+    (block $h2
+      (try_table (catch $b $h2) (call $deep (i32.const 8))))
+    (call $scrub)
+    (call $churn)
+    (call $rethrow (local.get $x)))
+
   ;; scrub catches many exceptions into locals, so any slot a returned frame
   ;; left behind is overwritten. Without it a stale slot can still be holding
   ;; A, and the test would pass without the global rooting anything.
