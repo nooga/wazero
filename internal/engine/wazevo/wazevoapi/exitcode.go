@@ -55,6 +55,12 @@ const (
 	// integers, which Go's GC cannot see, so every one that enters a frame
 	// is written to a shadow slot that keeps it alive.
 	ExitCodeShadowStore
+	// ExitCodeGlobalRefStore roots a reference a global now holds: Go writes
+	// it to ModuleInstance.GlobalRefs. Compiled code stores the global's
+	// value as raw bytes in the module context, where Go cannot see it, so
+	// the side table is what keeps the object alive once the frame that
+	// produced it is gone.
+	ExitCodeGlobalRefStore
 	exitCodeMax
 )
 
@@ -121,6 +127,8 @@ func (e ExitCode) String() string {
 		return "try_table_enter"
 	case ExitCodeShadowStore:
 		return "shadow_store"
+	case ExitCodeGlobalRefStore:
+		return "global_ref_store"
 	case ExitCodeTryTableLeave:
 		return "try_table_leave"
 	}

@@ -1142,6 +1142,9 @@ func (c *Compiler) lowerCurrentOpcode() {
 			break
 		}
 		v := c.getWasmGlobalValue(index, false)
+		if c.globalShadowed[index] {
+			c.emitShadowStore(c.allocShadowSlot(), v)
+		}
 		state.push(v)
 	case wasm.OpcodeGlobalSet:
 		index := c.readI32u()
@@ -1150,6 +1153,7 @@ func (c *Compiler) lowerCurrentOpcode() {
 		}
 		v := state.pop()
 		c.setWasmGlobalValue(index, v)
+		c.rootGlobal(index, v)
 	case wasm.OpcodeLocalGet:
 		index := c.readI32u()
 		if state.unreachable {
@@ -3506,6 +3510,9 @@ func (c *Compiler) lowerCurrentOpcode() {
 		targetOffsetInTable := state.pop()
 		elementAddr := c.lowerAccessTableWithBoundsCheck(tableIndex, targetOffsetInTable)
 		loaded := builder.AllocateInstruction().AsLoad(elementAddr, 0, ssa.TypeI64).Insert(builder).Return()
+		if c.tableShadowed(tableIndex) {
+			c.emitShadowStore(c.allocShadowSlot(), loaded)
+		}
 		state.push(loaded)
 
 	case wasm.OpcodeTailCallReturnCallIndirect:
@@ -4020,26 +4027,12 @@ func (c *Compiler) lowerAccessTableWithBoundsCheck(tableIndex uint32, elementOff
 func (c *Compiler) prepareCall(fnIndex uint32) (isIndirect bool, sig *ssa.Signature, args ssa.Values, funcRefOrPtrValue uint64) {
 	builder := c.ssaBuilder
 	state := c.state()
-	var typIndex wasm.Index
 	if fnIndex < c.m.ImportFunctionCount {
 		// Before transfer the control to the callee, we have to store the current module's moduleContextPtr
 		// into execContext.callerModuleContextPtr in case when the callee is a Go function.
 		c.storeCallerModuleContext()
-		var fi int
-		for i := range c.m.ImportSection {
-			imp := &c.m.ImportSection[i]
-			if imp.Type == wasm.ExternTypeFunc {
-				if fi == int(fnIndex) {
-					typIndex = imp.DescFunc
-					break
-				}
-				fi++
-			}
-		}
-	} else {
-		typIndex = c.m.FunctionSection[fnIndex-c.m.ImportFunctionCount]
 	}
-	typ := &c.m.TypeSection[typIndex]
+	typ := c.wasmFuncType(fnIndex)
 
 	argN := len(typ.Params)
 	tail := len(state.values) - argN
@@ -4083,6 +4076,7 @@ func (c *Compiler) lowerCall(fnIndex uint32) {
 	builder.InsertInstruction(call)
 
 	first, rest := call.Returns()
+	c.rootResults(c.wasmFuncType(fnIndex), first, rest)
 	if first.Valid() {
 		state.push(first)
 	}
@@ -4174,6 +4168,7 @@ func (c *Compiler) lowerCallIndirect(typeIndex, tableIndex uint32) {
 	builder.InsertInstruction(call)
 
 	first, rest := call.Returns()
+	c.rootResults(typ, first, rest)
 	if first.Valid() {
 		state.push(first)
 	}
@@ -4295,6 +4290,7 @@ func (c *Compiler) lowerCallRef(typeIndex uint32) {
 	builder.InsertInstruction(call)
 
 	first, rest := call.Returns()
+	c.rootResults(typ, first, rest)
 	if first.Valid() {
 		state.push(first)
 	}

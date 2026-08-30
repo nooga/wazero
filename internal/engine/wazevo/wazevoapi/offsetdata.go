@@ -84,6 +84,9 @@ const (
 	// ExecutionContextOffsetShadowStoreTrampolineAddress is the address of the
 	// shadow-store trampoline: (execCtx, slot, ptr) -> ().
 	ExecutionContextOffsetShadowStoreTrampolineAddress Offset = 1264
+	// ExecutionContextOffsetGlobalRefStoreTrampolineAddress is the address of
+	// the global-ref-store trampoline: (execCtx, globalIndex, ptr) -> ().
+	ExecutionContextOffsetGlobalRefStoreTrampolineAddress Offset = 1272
 )
 
 // ModuleContextOffsetData allows the compilers to get the information about offsets to the fields of wazevo.moduleContextOpaque,

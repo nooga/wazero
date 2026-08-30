@@ -174,6 +174,9 @@ type (
 		// shadowStoreTrampolineAddress holds the address of the shadow-store
 		// trampoline function.
 		shadowStoreTrampolineAddress *byte
+		// globalRefStoreTrampolineAddress holds the address of the
+		// global-ref-store trampoline function.
+		globalRefStoreTrampolineAddress *byte
 	}
 )
 
@@ -642,6 +645,13 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 			// avoids a uintptr conversion, which would trip checkptr.
 			s := goCallStackView(c.execCtx.stackPointerBeforeGoCall)
 			c.setShadowRef(int(s[0]), *(*unsafe.Pointer)(unsafe.Pointer(&s[1])))
+			c.execCtx.exitCode = wazevoapi.ExitCodeOK
+			afterGoFunctionCallEntrypoint(c.execCtx.goCallReturnAddress, c.execCtxPtr,
+				uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall)), c.execCtx.framePointerBeforeGoCall)
+		case wazevoapi.ExitCodeGlobalRefStore:
+			// Global ref store: (execCtx, globalIndex, ptr) -> ().
+			s := goCallStackView(c.execCtx.stackPointerBeforeGoCall)
+			c.callerModuleInstance().SetGlobalRef(wasm.Index(s[0]), *(*unsafe.Pointer)(unsafe.Pointer(&s[1])))
 			c.execCtx.exitCode = wazevoapi.ExitCodeOK
 			afterGoFunctionCallEntrypoint(c.execCtx.goCallReturnAddress, c.execCtxPtr,
 				uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall)), c.execCtx.framePointerBeforeGoCall)

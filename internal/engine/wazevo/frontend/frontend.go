@@ -50,9 +50,12 @@ type Compiler struct {
 	// memoryMinSizeInBytes is the static minimum size of the memory in bytes
 	// (zero if there is no memory). Since memories never shrink, any access
 	// whose end is a constant within this bound can never be out of bounds.
-	memoryMinSizeInBytes          uint64
-	globalVariables               []ssa.Variable
-	globalVariablesTypes          []ssa.Type
+	memoryMinSizeInBytes uint64
+	globalVariables      []ssa.Variable
+	globalVariablesTypes []ssa.Type
+	// globalShadowed is index-correlated with globalVariables and marks the
+	// globals whose value carries a reference the collector must see.
+	globalShadowed                []bool
 	mutableGlobalVariablesIndexes []wasm.Index // index to ^.
 	needListener                  bool
 	needSourceOffsetInfo          bool
@@ -78,6 +81,9 @@ type Compiler struct {
 	// shadowStoreSig is the signature for the shadow-store trampoline:
 	// (execCtx, slot, ptr) -> (). Roots ptr in this frame's shadow slot.
 	shadowStoreSig ssa.Signature
+	// globalRefStoreSig is the signature for the global-ref-store trampoline:
+	// (execCtx, globalIndex, ptr) -> ().
+	globalRefStoreSig ssa.Signature
 	// shadowSlots counts the shadow slots this function reserves. Assigned
 	// as sites are lowered; the total reaches the backend through
 	// ssa.Builder.SetShadowFrameSize.
@@ -333,6 +339,13 @@ func (c *Compiler) declareSignatures(listenerOn bool) {
 		Results: []ssa.Type{},
 	}
 	c.ssaBuilder.DeclareSignature(&c.shadowStoreSig)
+
+	c.globalRefStoreSig = ssa.Signature{
+		ID:      c.shadowStoreSig.ID + 1,
+		Params:  []ssa.Type{ssa.TypeI64 /* exec context */, ssa.TypeI64 /* global index */, ssa.TypeI64 /* ptr */},
+		Results: []ssa.Type{},
+	}
+	c.ssaBuilder.DeclareSignature(&c.globalRefStoreSig)
 }
 
 // SignatureForWasmFunctionType returns the ssa.Signature for the given wasm.FunctionType.
@@ -462,16 +475,14 @@ func (c *Compiler) declareShadowSlots() {
 		c.exnrefLocalSlot = append(c.exnrefLocalSlot, slot)
 	}
 
-	// A try_table may hand the body an exnref through catch_ref, which needs
-	// a slot the signature does not reveal. Searching for the opcode byte
-	// over-approximates — a v128 shuffle mask or any other immediate can
-	// look like one — but it never misses a real try_table, and a false
-	// positive only costs a frame adjust. Only modules that declare a tag
-	// are searched at all, so a module that does not use exceptions compiles
-	// exactly as before.
-	c.needsShadowFrame = c.shadowSlots > 0 ||
-		(c.m.ImportTagCount > 0 || len(c.m.TagSection) > 0) &&
-			bytes.IndexByte(c.wasmFunctionBody, wasm.OpcodeTryTable) >= 0
+	// The body can also take a reference from a try_table's catch_ref, a
+	// global, a table or a call result, none of which the signature reveals.
+	// Searching for the opcode byte over-approximates — a v128 shuffle mask
+	// or any other immediate can look like one — but it never misses a real
+	// instruction, and a false positive only costs a frame adjust. Each
+	// search is guarded by whether the module declares such a source at all,
+	// so a module that has none compiles exactly as before.
+	c.needsShadowFrame = c.shadowSlots > 0 || c.bodyMayTakeRef()
 }
 
 // rootParams roots exnref-typed parameters in their own frame. The caller
@@ -484,6 +495,148 @@ func (c *Compiler) rootParams() {
 		}
 		c.emitShadowStore(c.exnrefLocalSlot[i], c.ssaBuilder.MustFindValue(c.localVariable(wasm.Index(i))))
 	}
+}
+
+// bodyMayTakeRef reports whether this function body might take a reference
+// from somewhere its signature does not show. Over-approximates: see the
+// caller.
+func (c *Compiler) bodyMayTakeRef() bool {
+	body := c.wasmFunctionBody
+	has := func(op wasm.Opcode) bool { return bytes.IndexByte(body, op) >= 0 }
+
+	if c.m.ImportTagCount > 0 || len(c.m.TagSection) > 0 {
+		if has(wasm.OpcodeTryTable) {
+			return true
+		}
+	}
+	for _, shadowed := range c.globalShadowed {
+		if shadowed && has(wasm.OpcodeGlobalGet) {
+			return true
+		}
+	}
+	if c.moduleHasShadowedTable() && has(wasm.OpcodeTableGet) {
+		return true
+	}
+	if c.moduleReturnsRef() &&
+		(has(wasm.OpcodeCall) || has(wasm.OpcodeCallIndirect) || has(wasm.OpcodeCallRef)) {
+		return true
+	}
+	return false
+}
+
+// moduleHasShadowedTable reports whether any table in the module holds
+// reference-typed elements.
+func (c *Compiler) moduleHasShadowedTable() bool {
+	for i := range c.m.ImportSection {
+		if imp := &c.m.ImportSection[i]; imp.Type == wasm.ExternTypeTable &&
+			wasm.IsShadowedRef(imp.DescTable.Type) {
+			return true
+		}
+	}
+	for i := range c.m.TableSection {
+		if wasm.IsShadowedRef(c.m.TableSection[i].Type) {
+			return true
+		}
+	}
+	return false
+}
+
+// moduleReturnsRef reports whether any declared type returns a reference, so
+// that a call in this body could hand one back.
+func (c *Compiler) moduleReturnsRef() bool {
+	for i := range c.m.TypeSection {
+		for _, t := range c.m.TypeSection[i].Results {
+			if wasm.IsShadowedRef(t) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// rootGlobal records in the module's side table that global index now holds v.
+// Compiled code writes the global itself as raw bytes into the module context,
+// where Go cannot see it, so without this the object dies as soon as the frame
+// that produced it releases its slots.
+func (c *Compiler) rootGlobal(index wasm.Index, v ssa.Value) {
+	if !c.globalShadowed[index] {
+		return
+	}
+	builder := c.ssaBuilder
+	ptr := builder.AllocateInstruction().
+		AsLoad(c.execCtxPtrValue,
+			wazevoapi.ExecutionContextOffsetGlobalRefStoreTrampolineAddress.U32(),
+			ssa.TypeI64,
+		).Insert(builder).Return()
+	idx := builder.AllocateInstruction().AsIconst64(uint64(index)).Insert(builder).Return()
+	args := c.allocateVarLengthValues(3, c.execCtxPtrValue, idx, v)
+	builder.AllocateInstruction().
+		AsCallIndirect(ptr, &c.globalRefStoreSig, args).
+		Insert(builder)
+}
+
+// rootIfShadowed roots v in a fresh slot when t is a reference type, and
+// reports whether it did. Used where a value enters the frame from outside:
+// a global, a table, or a call result.
+func (c *Compiler) rootIfShadowed(t wasm.ValueType, v ssa.Value) {
+	if wasm.IsShadowedRef(t) {
+		c.emitShadowStore(c.allocShadowSlot(), v)
+	}
+}
+
+// rootResults roots the reference-typed results a call just returned. The
+// callee's frame is gone by now, so its slots no longer hold them.
+func (c *Compiler) rootResults(typ *wasm.FunctionType, first ssa.Value, rest []ssa.Value) {
+	for i, t := range typ.Results {
+		if !wasm.IsShadowedRef(t) {
+			continue
+		}
+		if i == 0 {
+			c.rootIfShadowed(t, first)
+			continue
+		}
+		c.rootIfShadowed(t, rest[i-1])
+	}
+}
+
+// wasmFuncType returns the declared type of function fnIndex, which may be
+// imported or defined in this module.
+func (c *Compiler) wasmFuncType(fnIndex uint32) *wasm.FunctionType {
+	var typIndex wasm.Index
+	if fnIndex < c.m.ImportFunctionCount {
+		var fi int
+		for i := range c.m.ImportSection {
+			imp := &c.m.ImportSection[i]
+			if imp.Type != wasm.ExternTypeFunc {
+				continue
+			}
+			if fi == int(fnIndex) {
+				typIndex = imp.DescFunc
+				break
+			}
+			fi++
+		}
+	} else {
+		typIndex = c.m.FunctionSection[fnIndex-c.m.ImportFunctionCount]
+	}
+	return &c.m.TypeSection[typIndex]
+}
+
+// tableShadowed reports whether table index holds reference-typed elements.
+func (c *Compiler) tableShadowed(index wasm.Index) bool {
+	var i wasm.Index
+	for j := range c.m.ImportSection {
+		if imp := &c.m.ImportSection[j]; imp.Type == wasm.ExternTypeTable {
+			if i == index {
+				return wasm.IsShadowedRef(imp.DescTable.Type)
+			}
+			i++
+		}
+	}
+	if idx := int(index - i); idx < len(c.m.TableSection) {
+		return wasm.IsShadowedRef(c.m.TableSection[idx].Type)
+	}
+	return false
 }
 
 // allocShadowSlot reserves the next shadow slot in this frame.
@@ -589,6 +742,7 @@ func (c *Compiler) declareNecessaryVariables() {
 	c.globalVariables = c.globalVariables[:0]
 	c.mutableGlobalVariablesIndexes = c.mutableGlobalVariablesIndexes[:0]
 	c.globalVariablesTypes = c.globalVariablesTypes[:0]
+	c.globalShadowed = c.globalShadowed[:0]
 	for _, imp := range c.m.ImportSection {
 		if imp.Type == wasm.ExternTypeGlobal {
 			desc := imp.DescGlobal
@@ -609,6 +763,7 @@ func (c *Compiler) declareWasmGlobal(typ wasm.ValueType, mutable bool) {
 	index := wasm.Index(len(c.globalVariables))
 	c.globalVariables = append(c.globalVariables, v)
 	c.globalVariablesTypes = append(c.globalVariablesTypes, st)
+	c.globalShadowed = append(c.globalShadowed, wasm.IsShadowedRef(typ))
 	if mutable {
 		c.mutableGlobalVariablesIndexes = append(c.mutableGlobalVariablesIndexes, index)
 	}

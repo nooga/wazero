@@ -32,6 +32,34 @@
     (call $churn)
     (call $rethrow (local.get $x)))
 
+  ;; stash catches A into the global and returns, so the frame that caught it
+  ;; is gone: only the global can be keeping A alive.
+  (func $stash
+    (block $h (result exnref)
+      (try_table (catch_all_ref $h) (throw $a (i32.const 15)))
+      (unreachable))
+    (global.set $ge))
+
+  ;; scrub catches many exceptions into locals, so any slot a returned frame
+  ;; left behind is overwritten. Without it a stale slot can still be holding
+  ;; A, and the test would pass without the global rooting anything.
+  (func $scrub
+    (local $i i32) (local $y exnref) (local $z exnref)
+    (loop $l
+      (block $h (result exnref)
+        (try_table (catch_all_ref $h) (throw $b))
+        (unreachable))
+      (local.set $y)
+      (local.set $z (local.get $y))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (i32.const 64)))))
+
+  (func (export "exnref_global_cross_call") (result i32)
+    (call $stash)
+    (call $scrub)
+    (call $churn)
+    (call $rethrow (global.get $ge)))
+
   (func (export "exnref_global") (result i32)
     (block $h (result exnref)
       (try_table (catch_all_ref $h) (throw $a (i32.const 14)))
