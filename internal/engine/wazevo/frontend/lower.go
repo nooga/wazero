@@ -1440,6 +1440,7 @@ func (c *Compiler) lowerCurrentOpcode() {
 		builder.InsertInstruction(br)
 
 		c.switchTo(originalLen, loopHeader)
+		c.rootLoopParams(bt.Params)
 
 		if c.ensureTermination {
 			checkModuleExitCodePtr := builder.AllocateInstruction().

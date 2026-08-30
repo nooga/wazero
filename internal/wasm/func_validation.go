@@ -2266,7 +2266,8 @@ func (m *Module) validateFunctionWithMaxStackValues(
 				default:
 					tp := ValueType(b)
 					if tp != ValueTypeI32 && tp != ValueTypeI64 && tp != ValueTypeF32 && tp != ValueTypeF64 &&
-						tp != ValueTypeExternref && tp != ValueTypeFuncref && tp != ValueTypeV128 {
+						tp != ValueTypeExternref && tp != ValueTypeFuncref && tp != ValueTypeExnref &&
+						tp != ValueTypeV128 {
 						return fmt.Errorf("invalid type %s for %s", ValueTypeName(tp), OpcodeTypedSelectName)
 					}
 				}

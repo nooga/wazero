@@ -527,6 +527,9 @@ func (c *Compiler) bodyMayTakeRef() bool {
 	if c.moduleHasShadowedTable() && has(wasm.OpcodeTableGet) {
 		return true
 	}
+	if c.moduleHasRefParamType() && has(wasm.OpcodeLoop) {
+		return true
+	}
 	if c.moduleReturnsRef() &&
 		(has(wasm.OpcodeCall) || has(wasm.OpcodeCallIndirect) || has(wasm.OpcodeCallRef)) {
 		return true
@@ -546,6 +549,19 @@ func (c *Compiler) moduleHasShadowedTable() bool {
 	for i := range c.m.TableSection {
 		if wasm.IsShadowedRef(c.m.TableSection[i].Type) {
 			return true
+		}
+	}
+	return false
+}
+
+// moduleHasRefParamType reports whether any declared type takes a reference,
+// so that a loop in this body could carry one as a block parameter.
+func (c *Compiler) moduleHasRefParamType() bool {
+	for i := range c.m.TypeSection {
+		for _, t := range c.m.TypeSection[i].Params {
+			if wasm.IsShadowedRef(t) {
+				return true
+			}
 		}
 	}
 	return false
@@ -606,6 +622,20 @@ func (c *Compiler) syncTableRefs(index wasm.Index) {
 		AsCallIndirect(ptr, &c.tableRefSyncSig, args).
 		Insert(builder)
 	c.reloadAfterCall()
+}
+
+// rootLoopParams roots the reference-typed parameters of a loop header. A loop
+// param is the one place a value crosses an iteration boundary without passing
+// through a local: the site that produced it runs again on the next iteration
+// and overwrites the slot that was rooting it, leaving the carried value with
+// nothing holding it.
+func (c *Compiler) rootLoopParams(types []wasm.ValueType) {
+	base := len(c.loweringState.values) - len(types)
+	for i, t := range types {
+		if wasm.IsShadowedRef(t) {
+			c.emitShadowStore(c.allocShadowSlot(), c.loweringState.values[base+i])
+		}
+	}
 }
 
 // rootIfShadowed roots v in a fresh slot when t is a reference type, and
@@ -682,6 +712,9 @@ func (c *Compiler) allocShadowSlot() int {
 // emitShadowStore roots v in this frame's shadow slot, so Go's collector keeps
 // the object alive while compiled code holds it as an opaque integer.
 func (c *Compiler) emitShadowStore(slot int, v ssa.Value) {
+	if !c.needsShadowFrame {
+		return
+	}
 	builder := c.ssaBuilder
 	ptr := builder.AllocateInstruction().
 		AsLoad(c.execCtxPtrValue,

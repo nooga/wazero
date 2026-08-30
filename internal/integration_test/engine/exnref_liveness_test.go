@@ -74,6 +74,7 @@ func runExnrefLivenessTests(t *testing.T, cfg wazero.RuntimeConfig) {
 		{"exnref_unwind", 16},
 		{"exnref_table", 17},
 		{"exnref_callee_slots", 18},
+		{"exnref_loop_param", 19},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()

@@ -100,6 +100,27 @@
     (call $churn)
     (call $rethrow (local.get $x)))
 
+  ;; The loop carries the previous iteration's exception as a block param while
+  ;; the catch inside the body produces a new one at the same site, overwriting
+  ;; the slot that used to root it. Only the loop param keeps it alive then.
+  ;; Iteration 1 keeps the fresh A, iteration 2 keeps the carried A and lets
+  ;; the site's slot go to B.
+  (func (export "exnref_loop_param") (result i32)
+    (local $i i32)
+    (ref.null exn)
+    (loop $l (param exnref) (result exnref)
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (block $h (result exnref)
+        (try_table (catch_all_ref $h)
+          (if (i32.eq (local.get $i) (i32.const 1))
+            (then (throw $a (i32.const 19)))
+            (else (throw $b))))
+        (unreachable))
+      (call $churn)
+      (select (result exnref) (i32.ne (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (i32.const 2))))
+    (call $rethrow))
+
   ;; scrub catches many exceptions into locals, so any slot a returned frame
   ;; left behind is overwritten. Without it a stale slot can still be holding
   ;; A, and the test would pass without the global rooting anything.
