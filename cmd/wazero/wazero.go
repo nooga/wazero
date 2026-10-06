@@ -415,6 +415,7 @@ func validateMounts(mounts sliceFlag, stdErr logging.Writer) (rc int, rootPath s
 			return 1, rootPath, config
 		} else if !stat.IsDir() {
 			fmt.Fprintf(stdErr, "invalid mount: path %q is not a directory\n", dir)
+			return 1, rootPath, config
 		}
 
 		root := sysfs.DirFS(dir)
@@ -437,12 +438,12 @@ func validateListens(listens sliceFlag, stdErr logging.Writer) (rc int, config s
 		idx := strings.LastIndexByte(listen, ':')
 		if idx < 0 {
 			fmt.Fprintln(stdErr, "invalid listen")
-			return rc, config
+			return 1, config
 		}
 		port, err := strconv.Atoi(listen[idx+1:])
 		if err != nil {
 			fmt.Fprintln(stdErr, "invalid listen port:", err)
-			return rc, config
+			return 1, config
 		}
 		if config == nil {
 			config = sock.NewConfig()
@@ -581,7 +582,7 @@ func (f *logScopesFlag) String() string {
 }
 
 func (f *logScopesFlag) Set(input string) error {
-	for _, s := range strings.Split(input, ",") {
+	for s := range strings.SplitSeq(input, ",") {
 		switch s {
 		case "":
 			continue

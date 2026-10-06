@@ -1,6 +1,7 @@
 package wazevo
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -182,12 +183,19 @@ func serializeCompiledModule(wazeroVersion string, cm *compiledModule) io.Reader
 	} else {
 		buf.WriteByte(0) // indicates that source map is not present.
 	}
-	// Catch clause table: number of try_tables (4 bytes), then for each:
-	//   clause count (4 bytes), then for each clause: kind (1 byte) + tagIndex (4 bytes).
-	buf.Write(u32.LeBytes(uint32(len(cm.catchClauseTable))))
-	for _, clauses := range cm.catchClauseTable {
-		buf.Write(u32.LeBytes(uint32(len(clauses))))
-		for _, c := range clauses {
+	// Try-table info: number of try_tables (4 bytes), then for each:
+	// numLocals (4 bytes), reuseLocals (1 byte), clause count (4 bytes),
+	// then for each clause: kind (1 byte) + tagIndex (4 bytes).
+	buf.Write(u32.LeBytes(uint32(len(cm.tryTableInfo))))
+	for _, info := range cm.tryTableInfo {
+		buf.Write(u32.LeBytes(uint32(info.NumLocals)))
+		b := byte(0)
+		if info.ReuseLocals {
+			b = 1
+		}
+		buf.WriteByte(b)
+		buf.Write(u32.LeBytes(uint32(len(info.CatchClauses))))
+		for _, c := range info.CatchClauses {
 			buf.WriteByte(c.Kind)
 			buf.Write(u32.LeBytes(c.TagIndex))
 		}
@@ -195,14 +203,17 @@ func serializeCompiledModule(wazeroVersion string, cm *compiledModule) io.Reader
 	return bytes.NewReader(buf.Bytes())
 }
 
-func deserializeCompiledModule(wazeroVersion string, reader io.ReadCloser) (cm *compiledModule, staleCache bool, err error) {
-	defer reader.Close()
+func deserializeCompiledModule(wazeroVersion string, rc io.ReadCloser) (cm *compiledModule, staleCache bool, err error) {
+	defer rc.Close()
+	// The entry is decoded in many small fields, so buffer it rather than
+	// issuing one read per field against the underlying cache file.
+	reader := bufio.NewReader(rc)
 	cacheHeaderSize := len(magic) + 1 /* version size */ + len(wazeroVersion) + 4 /* number of functions */
 
 	// Read the header before the native code.
 	header := make([]byte, cacheHeaderSize)
-	n, err := reader.Read(header)
-	if err != nil {
+	n, err := io.ReadFull(reader, header)
+	if err != nil && err != io.ErrUnexpectedEOF {
 		return nil, false, fmt.Errorf("compilationcache: error reading header: %v", err)
 	}
 
@@ -301,15 +312,20 @@ func deserializeCompiledModule(wazeroVersion string, reader io.ReadCloser) (cm *
 			sm.executableOffsets = append(sm.executableOffsets, uintptr(executableRelativeOffset)+executableOffset)
 		}
 	}
-	// Catch clause table.
+	// Try-table info.
 	if _, err = io.ReadFull(reader, eightBytes[:4]); err != nil {
-		// Treat old cache entries without catch clause data as stale (trigger recompile).
+		// Treat old cache entries without try-table data as stale (trigger recompile).
 		return nil, true, nil
 	}
 	tableLen := binary.LittleEndian.Uint32(eightBytes[:4])
 	if tableLen > 0 {
-		cm.catchClauseTable = make([][]wazevoapi.CatchClauseInstance, tableLen)
+		cm.tryTableInfo = make([]wazevoapi.TryTableInfo, tableLen)
 		for i := uint32(0); i < tableLen; i++ {
+			if _, err = io.ReadFull(reader, eightBytes[:5]); err != nil {
+				return nil, false, fmt.Errorf("compilationcache: error reading try_table[%d] header: %v", i, err)
+			}
+			numLocals := int(binary.LittleEndian.Uint32(eightBytes[:4]))
+			reuseLocals := eightBytes[4] != 0
 			if _, err = io.ReadFull(reader, eightBytes[:4]); err != nil {
 				return nil, false, fmt.Errorf("compilationcache: error reading catch clause count for try_table[%d]: %v", i, err)
 			}
@@ -324,7 +340,11 @@ func deserializeCompiledModule(wazeroVersion string, reader io.ReadCloser) (cm *
 					TagIndex: binary.LittleEndian.Uint32(eightBytes[1:5]),
 				}
 			}
-			cm.catchClauseTable[i] = clauses
+			cm.tryTableInfo[i] = wazevoapi.TryTableInfo{
+				CatchClauses: clauses,
+				NumLocals:    numLocals,
+				ReuseLocals:  reuseLocals,
+			}
 		}
 	}
 	return
@@ -334,11 +354,10 @@ func deserializeCompiledModule(wazeroVersion string, reader io.ReadCloser) (cm *
 // given array as a buffer. This returns io.EOF if less than 8 bytes were read.
 func readUint64(reader io.Reader, b *[8]byte) (uint64, error) {
 	s := b[0:8]
-	n, err := reader.Read(s)
-	if err != nil {
-		return 0, err
-	} else if n < 8 { // more strict than reader.Read
+	if _, err := io.ReadFull(reader, s); err == io.ErrUnexpectedEOF {
 		return 0, io.EOF
+	} else if err != nil {
+		return 0, err
 	}
 
 	// Read the u64 from the underlying buffer.

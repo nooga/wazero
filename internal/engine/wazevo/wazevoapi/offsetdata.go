@@ -70,6 +70,26 @@ const (
 	// ExecutionContextOffsetCaughtExceptionClauseIdx is the matched catch clause index
 	// written by handleException and read by compiled handler dispatch code.
 	ExecutionContextOffsetCaughtExceptionClauseIdx Offset = 1232
+	// ExecutionContextOffsetLocalsSaveAreaPtr points to a heap-allocated buffer
+	// where locals are mirrored inside try_table bodies, so that handler blocks
+	// can read throw-time local values after stack-clone restore.
+	ExecutionContextOffsetLocalsSaveAreaPtr Offset = 1240
+	// ExecutionContextOffsetMemclrAddress is the offset of `memclrAddress` in executionContext.
+	ExecutionContextOffsetMemclrAddress Offset = 1248
+	// ExecutionContextOffsetShadowRefsTop is the index just past the current
+	// frame's shadow slots in callEngine.refs. A function's prologue adds its
+	// slot count and the epilogue subtracts it, so each frame owns a distinct
+	// range and recursion cannot clobber an outer frame's roots.
+	ExecutionContextOffsetShadowRefsTop Offset = 1256
+	// ExecutionContextOffsetShadowStoreTrampolineAddress is the address of the
+	// shadow-store trampoline: (execCtx, slot, ptr) -> ().
+	ExecutionContextOffsetShadowStoreTrampolineAddress Offset = 1264
+	// ExecutionContextOffsetGlobalRefStoreTrampolineAddress is the address of
+	// the global-ref-store trampoline: (execCtx, globalIndex, ptr) -> ().
+	ExecutionContextOffsetGlobalRefStoreTrampolineAddress Offset = 1272
+	// ExecutionContextOffsetTableRefSyncTrampolineAddress is the address of
+	// the table-ref-sync trampoline: (execCtx, tableIndex) -> ().
+	ExecutionContextOffsetTableRefSyncTrampolineAddress Offset = 1280
 )
 
 // ModuleContextOffsetData allows the compilers to get the information about offsets to the fields of wazevo.moduleContextOpaque,

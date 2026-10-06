@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"unsafe"
 
 	"github.com/tetratelabs/wazero/api"
 )
@@ -90,6 +91,11 @@ type TableInstance struct {
 	//
 	// Currently, only function references are supported.
 	References []Reference
+
+	// Refs is a side table, index-correlated with References, holding the Go
+	// pointer behind an entry that carries a reference as an opaque uint64,
+	// so Go's GC keeps it alive. nil until the first such entry is stored.
+	Refs []unsafe.Pointer
 
 	// Min is the minimum (function) elements in this table and cannot grow to accommodate ElementSegment.
 	Min uint32
@@ -327,6 +333,9 @@ func (t *TableInstance) Grow(delta uint32, initialRef Reference) (currentLen uin
 	}
 
 	t.References = append(t.References, make([]uintptr, delta)...)
+	if t.Refs != nil {
+		t.Refs = append(t.Refs, make([]unsafe.Pointer, delta)...)
+	}
 	if initialRef == 0 {
 		return
 	}
@@ -339,4 +348,62 @@ func (t *TableInstance) Grow(delta uint32, initialRef Reference) (currentLen uin
 		copy(newRegion[i:], newRegion[:i])
 	}
 	return
+}
+
+// RefAt returns the Go pointer behind References[i], nil when the entry
+// carries no shadowed reference.
+func (t *TableInstance) RefAt(i uint32) unsafe.Pointer {
+	if t.Refs == nil {
+		return nil
+	}
+	return t.Refs[i]
+}
+
+// SetRef records the Go pointer behind References[i]. Allocates the side
+// table on the first non-nil store.
+func (t *TableInstance) SetRef(i uint32, p unsafe.Pointer) {
+	if t.Refs == nil {
+		if p == nil {
+			return
+		}
+		t.Refs = make([]unsafe.Pointer, len(t.References))
+	}
+	t.Refs[i] = p
+}
+
+// FillRefs sets Refs[off:off+n] to p, mirroring a fill of References.
+func (t *TableInstance) FillRefs(off, n uint32, p unsafe.Pointer) {
+	if t.Refs == nil && p == nil {
+		return
+	}
+	for i := uint32(0); i < n; i++ {
+		t.SetRef(off+i, p)
+	}
+}
+
+// CopyRefs mirrors copy(dst.References[dstOff:], src.References[srcOff:srcOff+n]).
+func (dst *TableInstance) CopyRefs(dstOff uint32, src *TableInstance, srcOff, n uint32) {
+	if src.Refs == nil {
+		dst.FillRefs(dstOff, n, nil)
+		return
+	}
+	if dst.Refs == nil {
+		dst.Refs = make([]unsafe.Pointer, len(dst.References))
+	}
+	copy(dst.Refs[dstOff:dstOff+n], src.Refs[srcOff:srcOff+n])
+}
+
+// SyncRefs rebuilds Refs from References. For a reference-typed table the
+// element is the Go pointer, so this recovers what the collector must see
+// after a write it could not observe. Only sound while the objects are still
+// alive, so call it right after the write that stored them.
+func (t *TableInstance) SyncRefs() {
+	if t.Refs == nil {
+		t.Refs = make([]unsafe.Pointer, len(t.References))
+	} else if len(t.Refs) != len(t.References) {
+		t.Refs = append(t.Refs, make([]unsafe.Pointer, len(t.References)-len(t.Refs))...)
+	}
+	for i := range t.References {
+		t.Refs[i] = *(*unsafe.Pointer)(unsafe.Pointer(&t.References[i]))
+	}
 }

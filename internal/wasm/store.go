@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/tetratelabs/wazero/api"
 	"github.com/tetratelabs/wazero/experimental"
@@ -78,6 +79,13 @@ type (
 		MemoryInstance *MemoryInstance
 		Tables         []*TableInstance
 		Tags           []*TagInstance
+
+		// GlobalRefs is a side table, index-correlated with Globals, holding
+		// the Go pointer behind a reference a global carries as an opaque
+		// uint64. Only globals whose type the engine shadows get a slot; the
+		// rest stay nil and cost nothing. Imported globals alias the
+		// exporter's slot so both modules see the same pointer.
+		GlobalRefs []*unsafe.Pointer
 
 		// Engine implements function calls for this module.
 		Engine ModuleEngine
@@ -521,6 +529,7 @@ func (m *ModuleInstance) resolveImports(ctx context.Context, module *Module) (er
 					return
 				}
 				m.Globals[i.IndexPerType] = importedGlobal
+				m.shareGlobalRef(i.IndexPerType, importedModule, imported.Index)
 			case ExternTypeTag:
 				expected := &module.TypeSection[i.DescTag]
 				importedTag := importedModule.Tags[imported.Index]
@@ -723,4 +732,45 @@ func (s *Store) CloseWithExitCode(ctx context.Context, exitCode uint32) error {
 	s.nameToModuleCap = 0
 	s.typeIDs = nil
 	return errors.Join(errs...)
+}
+
+// globalRefSlot returns the GlobalRefs slot for the defined global at idx,
+// allocating the side table on first use.
+func (m *ModuleInstance) globalRefSlot(idx Index) *unsafe.Pointer {
+	if m.GlobalRefs == nil {
+		m.GlobalRefs = make([]*unsafe.Pointer, len(m.Globals))
+	}
+	if m.GlobalRefs[idx] == nil {
+		m.GlobalRefs[idx] = new(unsafe.Pointer)
+	}
+	return m.GlobalRefs[idx]
+}
+
+// GlobalRef returns the Go pointer behind global idx, nil if it holds no
+// shadowed reference.
+func (m *ModuleInstance) GlobalRef(idx Index) unsafe.Pointer {
+	if m.GlobalRefs == nil || m.GlobalRefs[idx] == nil {
+		return nil
+	}
+	return *m.GlobalRefs[idx]
+}
+
+// SetGlobalRef records the Go pointer behind global idx. No-op for globals
+// that cannot hold a shadowed reference.
+func (m *ModuleInstance) SetGlobalRef(idx Index, p unsafe.Pointer) {
+	if m.GlobalRefs == nil || m.GlobalRefs[idx] == nil {
+		return
+	}
+	*m.GlobalRefs[idx] = p
+}
+
+// shareGlobalRef makes imported global idx alias the exporter's ref slot.
+func (m *ModuleInstance) shareGlobalRef(idx Index, exporter *ModuleInstance, exportedIdx Index) {
+	if exporter.GlobalRefs == nil || exporter.GlobalRefs[exportedIdx] == nil {
+		return
+	}
+	if m.GlobalRefs == nil {
+		m.GlobalRefs = make([]*unsafe.Pointer, len(m.Globals))
+	}
+	m.GlobalRefs[idx] = exporter.GlobalRefs[exportedIdx]
 }

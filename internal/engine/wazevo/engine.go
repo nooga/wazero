@@ -76,7 +76,16 @@ type (
 		tryTableEnterAddress *byte
 		// tryTableLeaveAddress is the address of try_table leave trampoline.
 		tryTableLeaveAddress *byte
-		listenerTrampolines  listenerTrampolines
+		// shadowStoreAddress is the address of the shadow-store trampoline,
+		// which roots a reference in the current frame's shadow slot.
+		shadowStoreAddress *byte
+		// globalRefStoreAddress is the address of the global-ref-store
+		// trampoline, which roots a reference a global now holds.
+		globalRefStoreAddress *byte
+		// tableRefSyncAddress is the address of the table-ref-sync
+		// trampoline, which rebuilds a table's Refs side table.
+		tableRefSyncAddress *byte
+		listenerTrampolines listenerTrampolines
 	}
 
 	listenerTrampolines = map[*wasm.FunctionType]struct {
@@ -102,9 +111,9 @@ type (
 		offsets         wazevoapi.ModuleContextOffsetData
 		sharedFunctions *sharedFunctions
 		sourceMap       sourceMap
-		// catchClauseTable stores catch clause info for each try_table,
-		// indexed by a try_table ID assigned during compilation.
-		catchClauseTable [][]wazevoapi.CatchClauseInstance
+		// tryTableInfo stores per-try_table metadata (catch clauses,
+		// local count) indexed by try_table ID assigned during compilation.
+		tryTableInfo []wazevoapi.TryTableInfo
 	}
 
 	executables struct {
@@ -281,7 +290,7 @@ func (e *engine) compileModule(ctx context.Context, module *wasm.Module, listene
 
 			relocator.appendFunction(fctx, module, cm, i, fidx, body, relsPerFunc, be.SourceOffsetInfo())
 		}
-		cm.catchClauseTable = fe.CatchClauseTable()
+		cm.tryTableInfo = fe.TryTableMetadata()
 	} else {
 		// Compile with N worker goroutines.
 		// Collect compiled functions across workers in a slice,
@@ -300,9 +309,9 @@ func (e *engine) compileModule(ctx context.Context, module *wasm.Module, listene
 		ctx, cancel := context.WithCancelCause(ctx)
 		defer cancel(nil)
 
-		// Catch clause table IDs are baked into compiled machine code, so all
+		// Try-table IDs are baked into compiled machine code, so all
 		// workers must share a single table to ensure globally unique IDs.
-		sharedCCT := frontend.NewSharedCatchClauseTable()
+		sharedTTM := frontend.NewSharedTryTableMetadata()
 
 		var count atomic.Uint32
 		var wg sync.WaitGroup
@@ -318,7 +327,7 @@ func (e *engine) compileModule(ctx context.Context, module *wasm.Module, listene
 				be := backend.NewCompiler(ctx, machine, ssaBuilder)
 				fe := frontend.NewFrontendCompiler(
 					module, ssaBuilder, &cm.offsets, ensureTermination, withListener, needSourceInfo).
-					WithCatchClauseTable(sharedCCT)
+					WithTryTableMetadata(sharedTTM)
 
 				for {
 					if err := ctx.Err(); err != nil {
@@ -365,7 +374,7 @@ func (e *engine) compileModule(ctx context.Context, module *wasm.Module, listene
 			fn := &compiledFuncs[i]
 			relocator.appendFunction(fn.fctx, module, cm, fn.fnum, fn.fidx, fn.body, fn.relsPerFunc, fn.offsPerFunc)
 		}
-		cm.catchClauseTable = sharedCCT.Table()
+		cm.tryTableInfo = sharedTTM.Table()
 	}
 
 	// Allocate executable memory and then copy the generated machine code.
@@ -753,7 +762,7 @@ func (e *engine) NewModuleEngine(m *wasm.Module, mi *wasm.ModuleInstance) (wasm.
 }
 
 func (e *engine) compileSharedFunctions() {
-	var sizes [12]int
+	var sizes [15]int
 	var trampolines []byte
 
 	addTrampoline := func(i int, buf []byte) {
@@ -853,6 +862,30 @@ func (e *engine) compileSharedFunctions() {
 			Results: []ssa.Type{},
 		}, false))
 
+	e.be.Init()
+	addTrampoline(12,
+		e.machine.CompileGoFunctionTrampoline(wazevoapi.ExitCodeShadowStore, &ssa.Signature{
+			// exec context, slot, ptr
+			Params:  []ssa.Type{ssa.TypeI64, ssa.TypeI64, ssa.TypeI64},
+			Results: []ssa.Type{},
+		}, false))
+
+	e.be.Init()
+	addTrampoline(13,
+		e.machine.CompileGoFunctionTrampoline(wazevoapi.ExitCodeGlobalRefStore, &ssa.Signature{
+			// exec context, global index, ptr
+			Params:  []ssa.Type{ssa.TypeI64, ssa.TypeI64, ssa.TypeI64},
+			Results: []ssa.Type{},
+		}, false))
+
+	e.be.Init()
+	addTrampoline(14,
+		e.machine.CompileGoFunctionTrampoline(wazevoapi.ExitCodeTableRefSync, &ssa.Signature{
+			// exec context, table index
+			Params:  []ssa.Type{ssa.TypeI64, ssa.TypeI64},
+			Results: []ssa.Type{},
+		}, false))
+
 	fns := &sharedFunctions{
 		executable:          mmapExecutable(trampolines),
 		listenerTrampolines: make(listenerTrampolines),
@@ -883,6 +916,12 @@ func (e *engine) compileSharedFunctions() {
 	fns.tryTableEnterAddress = &fns.executable[offset]
 	offset += sizes[10]
 	fns.tryTableLeaveAddress = &fns.executable[offset]
+	offset += sizes[11]
+	fns.shadowStoreAddress = &fns.executable[offset]
+	offset += sizes[12]
+	fns.globalRefStoreAddress = &fns.executable[offset]
+	offset += sizes[13]
+	fns.tableRefSyncAddress = &fns.executable[offset]
 
 	if wazevoapi.PerfMapEnabled {
 		wazevoapi.PerfMap.AddEntry(uintptr(unsafe.Pointer(fns.memoryGrowAddress)), uint64(sizes[0]), "memory_grow_trampoline")
@@ -897,6 +936,9 @@ func (e *engine) compileSharedFunctions() {
 		wazevoapi.PerfMap.AddEntry(uintptr(unsafe.Pointer(fns.throwTrampolineAddress)), uint64(sizes[9]), "throw_trampoline")
 		wazevoapi.PerfMap.AddEntry(uintptr(unsafe.Pointer(fns.tryTableEnterAddress)), uint64(sizes[10]), "try_table_enter_trampoline")
 		wazevoapi.PerfMap.AddEntry(uintptr(unsafe.Pointer(fns.tryTableLeaveAddress)), uint64(sizes[11]), "try_table_leave_trampoline")
+		wazevoapi.PerfMap.AddEntry(uintptr(unsafe.Pointer(fns.shadowStoreAddress)), uint64(sizes[12]), "shadow_store_trampoline")
+		wazevoapi.PerfMap.AddEntry(uintptr(unsafe.Pointer(fns.globalRefStoreAddress)), uint64(sizes[13]), "global_ref_store_trampoline")
+		wazevoapi.PerfMap.AddEntry(uintptr(unsafe.Pointer(fns.tableRefSyncAddress)), uint64(sizes[14]), "table_ref_sync_trampoline")
 	}
 
 	e.sharedFunctions = fns

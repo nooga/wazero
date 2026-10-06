@@ -179,6 +179,12 @@ type compiler struct {
 	sig *wasm.FunctionType
 	// localTypes holds the target function locals' value types except function params.
 	localTypes []wasm.ValueType
+	// refs is set once a shadowed reference may be live in this function
+	// (ref-typed params or locals, or any op producing one). From then on
+	// drops and branches are emitted as their Ref variants so the engine
+	// keeps its shadow ref stack in step. Functions that never see one get
+	// the plain ops and pay nothing.
+	refs bool
 	// localIndexToStackHeightInUint64 maps the local index (starting with function params) to the stack height
 	// where the local is places. This is the necessary mapping for functions who contain vector type locals.
 	localIndexToStackHeightInUint64 []int
@@ -189,6 +195,8 @@ type compiler struct {
 	funcs []uint32
 	// globals holds the global types for all declared globals in the module where the target function exists.
 	globals []wasm.GlobalType
+	// tables holds the table types for all declared tables in the module where the target function exists.
+	tables []wasm.Table
 	// tags holds the type indexes for all declared tags in the module where the target function exists.
 	tags []uint32
 
@@ -319,6 +327,7 @@ func newCompiler(enabledFeatures api.CoreFeatures, callFrameStackSizeInUint64 in
 			LabelCallers:        map[label]uint32{},
 		},
 		globals:           globals,
+		tables:            tables,
 		funcs:             functions,
 		tags:              tags,
 		types:             types,
@@ -375,6 +384,13 @@ func (c *compiler) compile(sig *wasm.FunctionType, body []byte, localTypes []was
 	c.localTypes = localTypes
 	c.sig = sig
 	c.bodyOffsetInCodeSection = bodyOffsetInCodeSection
+	c.refs = false
+	for _, t := range sig.Params {
+		c.refs = c.refs || wasm.IsShadowedRef(t)
+	}
+	for _, t := range localTypes {
+		c.refs = c.refs || wasm.IsShadowedRef(t)
+	}
 
 	// Reuses the underlying slices.
 	c.stack = c.stack[:0]
@@ -587,7 +603,7 @@ operatorSwitch:
 		// We need to reset the stack so that
 		// the values pushed inside the then block
 		// do not affect the else block.
-		dropOp := newOperationDrop(c.getFrameDropRange(frame, false))
+		dropOp := c.newDrop(c.getFrameDropRange(frame, false))
 
 		// Reset the stack manipulated by the then block, and re-push the block param types to the stack.
 
@@ -646,7 +662,7 @@ operatorSwitch:
 
 		// We need to reset the stack so that
 		// the values pushed inside the block.
-		dropOp := newOperationDrop(c.getFrameDropRange(frame, true))
+		dropOp := c.newDrop(c.getFrameDropRange(frame, true))
 		c.stackSwitchAt(frame)
 
 		// Push the result types onto the stack.
@@ -707,7 +723,7 @@ operatorSwitch:
 
 		targetFrame := c.controlFrames.get(int(targetIndex))
 		targetFrame.ensureContinuation()
-		dropOp := newOperationDrop(c.getFrameDropRange(targetFrame, false))
+		dropOp := c.newDrop(c.getFrameDropRange(targetFrame, false))
 		targetID := targetFrame.asLabel()
 		c.result.LabelCallers[targetID]++
 		c.emit(dropOp)
@@ -736,7 +752,7 @@ operatorSwitch:
 
 		continuationLabel := newLabel(labelKindHeader, c.nextFrameID())
 		c.result.LabelCallers[continuationLabel]++
-		c.emit(newOperationBrIf(target, continuationLabel, drop))
+		c.emit(c.newBrIf(target, continuationLabel, drop))
 		// Start emitting else block operations.
 		c.emit(newOperationLabel(continuationLabel))
 	case wasm.OpcodeBrTable:
@@ -793,7 +809,7 @@ operatorSwitch:
 		c.result.LabelCallers[defaultLabel]++
 		targetLabels[s] = uint64(defaultLabel)
 		targetLabels[s+1] = defaultTargetDrop.AsU64()
-		c.emit(newOperationBrTable(targetLabels))
+		c.emit(c.newBrTable(targetLabels))
 
 		// br_table operation is stack-polymorphic, and mark the state as unreachable.
 		// That means subsequent instructions in the current control frame are "unreachable"
@@ -801,7 +817,7 @@ operatorSwitch:
 		c.markUnreachable()
 	case wasm.OpcodeReturn:
 		functionFrame := c.controlFrames.functionFrame()
-		dropOp := newOperationDrop(c.getFrameDropRange(functionFrame, false))
+		dropOp := c.newDrop(c.getFrameDropRange(functionFrame, false))
 
 		// Cleanup the stack and then jmp to function frame's continuation (meaning return).
 		c.emit(dropOp)
@@ -833,6 +849,7 @@ operatorSwitch:
 		c.emit(newOperationThrowRef())
 		c.markUnreachable()
 	case wasm.OpcodeTryTable:
+		c.markRefs() // catch_ref and catch_all_ref push an exnref
 		c.br.Reset(c.body[c.pc+1:])
 		bt, num, err := wasm.DecodeBlockType(c.types, c.br, c.enabledFeatures)
 		if err != nil {
@@ -901,11 +918,13 @@ operatorSwitch:
 		}
 		c.controlFrames.push(frame)
 	case wasm.OpcodeCall:
+		c.markRefsIfResults(&c.types[c.funcs[index]])
 		c.emit(
 			newOperationCall(index),
 		)
 	case wasm.OpcodeCallIndirect:
 		typeIndex := index
+		c.markRefsIfResults(&c.types[typeIndex])
 		tableIndex, n, err := leb128.LoadUint32(c.body[c.pc+1:])
 		if err != nil {
 			return fmt.Errorf("read target for br_table: %w", err)
@@ -934,9 +953,15 @@ operatorSwitch:
 		)
 	case wasm.OpcodeTypedSelect:
 		// Skips two bytes: vector size fixed to 1, and the value type for select.
+		vt := wasm.ValueType(c.body[c.pc+2])
 		c.pc += 2
 		// If it is on the unreachable state, ignore the instruction.
 		if c.unreachableState.on {
+			break operatorSwitch
+		}
+		if wasm.IsShadowedRef(vt) {
+			c.markRefs()
+			c.emit(newOperationSelectRef())
 			break operatorSwitch
 		}
 		// Typed select is semantically equivalent to select at runtime.
@@ -946,7 +971,9 @@ operatorSwitch:
 		)
 	case wasm.OpcodeLocalGet:
 		depth := c.localDepth(index)
-		if isVector := c.localType(index) == wasm.ValueTypeV128; !isVector {
+		if lt := c.localType(index); wasm.IsShadowedRef(lt) {
+			c.emit(newOperationPickRef(depth - 1))
+		} else if isVector := lt == wasm.ValueTypeV128; !isVector {
 			c.emit(
 				// -1 because we already manipulated the stack before
 				// called localDepth ^^.
@@ -962,8 +989,11 @@ operatorSwitch:
 	case wasm.OpcodeLocalSet:
 		depth := c.localDepth(index)
 
-		isVector := c.localType(index) == wasm.ValueTypeV128
-		if isVector {
+		lt := c.localType(index)
+		isVector := lt == wasm.ValueTypeV128
+		if wasm.IsShadowedRef(lt) {
+			c.emit(newOperationSetRef(depth + 1))
+		} else if isVector {
 			c.emit(
 				// +2 because we already popped the operands for this operation from the c.stack before
 				// called localDepth ^^,
@@ -978,8 +1008,12 @@ operatorSwitch:
 		}
 	case wasm.OpcodeLocalTee:
 		depth := c.localDepth(index)
-		isVector := c.localType(index) == wasm.ValueTypeV128
-		if isVector {
+		lt := c.localType(index)
+		isVector := lt == wasm.ValueTypeV128
+		if wasm.IsShadowedRef(lt) {
+			c.emit(newOperationPickRef(0))
+			c.emit(newOperationSetRef(depth + 1))
+		} else if isVector {
 			c.emit(newOperationPick(1, isVector))
 			c.emit(newOperationSet(depth+2, isVector))
 		} else {
@@ -988,6 +1022,9 @@ operatorSwitch:
 			c.emit(newOperationSet(depth+1, isVector))
 		}
 	case wasm.OpcodeGlobalGet:
+		if wasm.IsShadowedRef(c.globals[index].ValType) {
+			c.markRefs()
+		}
 		c.emit(
 			newOperationGlobalGet(index),
 		)
@@ -1743,6 +1780,9 @@ operatorSwitch:
 			return fmt.Errorf("failed to read function index for table.get: %v", err)
 		}
 		c.pc += num - 1
+		if wasm.IsShadowedRef(c.tables[tableIndex].Type) {
+			c.markRefs()
+		}
 		c.emit(
 			newOperationTableGet(tableIndex),
 		)
@@ -3543,7 +3583,7 @@ operatorSwitch:
 		// For details, see internal/engine/RATIONALE.md
 		if _, _, isImport := fdef.Import(); isImport {
 			c.emit(newOperationCall(index))
-			dropOp := newOperationDrop(c.getFrameDropRange(functionFrame, false))
+			dropOp := c.newDrop(c.getFrameDropRange(functionFrame, false))
 
 			// Cleanup the stack and then jmp to function frame's continuation (meaning return).
 			c.emit(dropOp)
@@ -3575,6 +3615,7 @@ operatorSwitch:
 		c.markUnreachable()
 
 	case wasm.OpcodeCallRef:
+		c.markRefsIfResults(&c.types[index])
 		c.emit(newOperationCallRef(index))
 
 	case wasm.OpcodeReturnCallRef:
@@ -3756,7 +3797,7 @@ func (c *compiler) stackPush(ts unsignedType) {
 func (c *compiler) emit(op unionOperation) {
 	if !c.unreachableState.on {
 		switch op.Kind {
-		case operationKindDrop:
+		case operationKindDrop, operationKindDropRef:
 			// If the drop range is nil,
 			// we could remove such operations.
 			// That happens when drop operation is unnecessary.
@@ -3807,6 +3848,41 @@ func (c *compiler) emitDefaultValue(t wasm.ValueType) {
 func (c *compiler) localDepth(index wasm.Index) int {
 	height := c.localIndexToStackHeightInUint64[index]
 	return c.stackLenInUint64 - 1 - height
+}
+
+// markRefs records that a shadowed reference may be live from here on.
+func (c *compiler) markRefs() { c.refs = true }
+
+// markRefsIfResults is markRefs when a call to ft can return one.
+func (c *compiler) markRefsIfResults(ft *wasm.FunctionType) {
+	for _, t := range ft.Results {
+		if wasm.IsShadowedRef(t) {
+			c.refs = true
+			return
+		}
+	}
+}
+
+// newDrop returns the Drop op for r, or DropRef once refs may be live.
+func (c *compiler) newDrop(r inclusiveRange) unionOperation {
+	if c.refs {
+		return newOperationDropRef(r)
+	}
+	return newOperationDrop(r)
+}
+
+func (c *compiler) newBrIf(thenTarget, elseTarget label, thenDrop inclusiveRange) unionOperation {
+	if c.refs {
+		return newOperationBrIfRef(thenTarget, elseTarget, thenDrop)
+	}
+	return newOperationBrIf(thenTarget, elseTarget, thenDrop)
+}
+
+func (c *compiler) newBrTable(targetLabelsAndRanges []uint64) unionOperation {
+	if c.refs {
+		return newOperationBrTableRef(targetLabelsAndRanges)
+	}
+	return newOperationBrTable(targetLabelsAndRanges)
 }
 
 func (c *compiler) localType(index wasm.Index) (t wasm.ValueType) {
