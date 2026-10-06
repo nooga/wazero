@@ -82,7 +82,7 @@ type Runtime interface {
 	//	}
 	//	_, err := r.NewHostModuleBuilder("env").
 	//		NewFunctionBuilder().WithFunc(hello).Export("hello").
-	//		Instantiate(ctx, r)
+	//		Instantiate(ctx)
 	//
 	// Note: empty `moduleName` is not allowed.
 	NewHostModuleBuilder(moduleName string) HostModuleBuilder
@@ -132,7 +132,7 @@ type Runtime interface {
 	//	defer r.CloseWithExitCode(ctx, 2) // This closes everything this Runtime created.
 	//
 	//	// Everything below here can be closed, but will anyway due to above.
-	//	_, _ = wasi_snapshot_preview1.InstantiateSnapshotPreview1(ctx, r)
+	//	_, _ = wasi_snapshot_preview1.Instantiate(ctx, r)
 	//	mod, _ := r.Instantiate(ctx, wasm)
 	CloseWithExitCode(ctx context.Context, exitCode uint32) error
 
@@ -338,8 +338,16 @@ func (r *runtime) InstantiateModule(
 		name = code.module.NameSection.ModuleName
 	}
 
+	// Recompute typeIDs for the instantiating store. The compiled module may
+	// have been compiled in a different runtime/store (shared compilation
+	// cache pattern), so its cached typeIDs can differ from this store's.
+	typeIDs, err := r.store.GetFunctionTypeIDs(code.module.TypeSection)
+	if err != nil {
+		return nil, err
+	}
+
 	// Instantiate the module.
-	mod, err = r.store.Instantiate(ctx, code.module, name, sysCtx, code.typeIDs)
+	mod, err = r.store.Instantiate(ctx, code.module, name, sysCtx, typeIDs)
 	if err != nil {
 		// If there was an error, don't leak the compiled module.
 		if code.closeWithModule {

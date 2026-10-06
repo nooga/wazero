@@ -30,6 +30,7 @@ type Compiler struct {
 	tableGrowSig           ssa.Signature
 	refFuncSig             ssa.Signature
 	memmoveSig             ssa.Signature
+	memclrSig              ssa.Signature
 	ensureTermination      bool
 
 	// Followings are reset by per function.
@@ -46,11 +47,15 @@ type Compiler struct {
 	memoryBaseVariable, memoryLenVariable ssa.Variable
 	needMemory                            bool
 	memoryShared                          bool
-	globalVariables                       []ssa.Variable
-	globalVariablesTypes                  []ssa.Type
-	mutableGlobalVariablesIndexes         []wasm.Index // index to ^.
-	needListener                          bool
-	needSourceOffsetInfo                  bool
+	// memoryMinSizeInBytes is the static minimum size of the memory in bytes
+	// (zero if there is no memory). Since memories never shrink, any access
+	// whose end is a constant within this bound can never be out of bounds.
+	memoryMinSizeInBytes          uint64
+	globalVariables               []ssa.Variable
+	globalVariablesTypes          []ssa.Type
+	mutableGlobalVariablesIndexes []wasm.Index // index to ^.
+	needListener                  bool
+	needSourceOffsetInfo          bool
 	// br is reused during lowering.
 	br            *bytes.Reader
 	loweringState loweringState
@@ -74,8 +79,12 @@ type Compiler struct {
 	tryTableEnterSig ssa.Signature
 	// tryTableLeaveSig is the signature for the try_table leave trampoline.
 	tryTableLeaveSig ssa.Signature
-	// catchClauseTable accumulates catch clause info for each try_table during compilation.
-	catchClauseTable catchClauseTable
+	// tryTableMetadata accumulates try_table metadata during compilation.
+	tryTableMetadata tryTableMetadata
+	// tryTableDepth tracks try_table nesting. When > 0, local.set/local.tee
+	// emit extra stores to the locals save area so handler blocks can read
+	// throw-time values.
+	tryTableDepth int
 
 	// Following are reused for the known safe bounds analysis.
 
@@ -110,73 +119,71 @@ func NewFrontendCompiler(m *wasm.Module, ssaBuilder ssa.Builder, offset *wazevoa
 		offset:                            offset,
 		ensureTermination:                 ensureTermination,
 		needSourceOffsetInfo:              sourceInfo,
-		catchClauseTable:                  &localCatchClauseTable{},
+		tryTableMetadata:                  &localTryTableMetadata{},
 		varLengthKnownSafeBoundWithIDPool: wazevoapi.NewVarLengthPool[knownSafeBoundWithID](),
 	}
 	c.declareSignatures(listenerOn)
 	return c
 }
 
-// catchClauseTable accumulates catch clause entries during compilation.
-type catchClauseTable interface {
-	Append(clauses []wazevoapi.CatchClauseInstance) int
-	Table() [][]wazevoapi.CatchClauseInstance
+// tryTableMetadata accumulates try_table metadata during compilation.
+type tryTableMetadata interface {
+	Append(info wazevoapi.TryTableInfo) int
+	Table() []wazevoapi.TryTableInfo
 }
 
-// localCatchClauseTable is the single-threaded implementation.
-type localCatchClauseTable struct {
-	table [][]wazevoapi.CatchClauseInstance
+// localTryTableMetadata is the single-threaded implementation.
+type localTryTableMetadata struct {
+	table []wazevoapi.TryTableInfo
 }
 
-func (t *localCatchClauseTable) Append(clauses []wazevoapi.CatchClauseInstance) int {
+func (t *localTryTableMetadata) Append(info wazevoapi.TryTableInfo) int {
 	id := len(t.table)
-	t.table = append(t.table, clauses)
+	t.table = append(t.table, info)
 	return id
 }
 
-func (t *localCatchClauseTable) Table() [][]wazevoapi.CatchClauseInstance {
+func (t *localTryTableMetadata) Table() []wazevoapi.TryTableInfo {
 	return t.table
 }
 
-// SharedCatchClauseTable is the thread-safe implementation for parallel compilation.
-type SharedCatchClauseTable struct {
+// SharedTryTableMetadata is the thread-safe implementation for parallel compilation.
+type SharedTryTableMetadata struct {
 	mu        sync.Mutex
-	table     [][]wazevoapi.CatchClauseInstance
+	table     []wazevoapi.TryTableInfo
 	finalized bool
 }
 
-// NewSharedCatchClauseTable creates a new SharedCatchClauseTable.
-func NewSharedCatchClauseTable() *SharedCatchClauseTable {
-	return &SharedCatchClauseTable{}
+// NewSharedTryTableMetadata creates a new SharedTryTableMetadata.
+func NewSharedTryTableMetadata() *SharedTryTableMetadata {
+	return &SharedTryTableMetadata{}
 }
 
-func (s *SharedCatchClauseTable) Append(clauses []wazevoapi.CatchClauseInstance) int {
+func (s *SharedTryTableMetadata) Append(info wazevoapi.TryTableInfo) int {
 	if s.finalized {
 		panic("already finalized")
 	}
 	s.mu.Lock()
 	id := len(s.table)
-	s.table = append(s.table, clauses)
+	s.table = append(s.table, info)
 	s.mu.Unlock()
 	return id
 }
 
-func (s *SharedCatchClauseTable) Table() [][]wazevoapi.CatchClauseInstance {
+func (s *SharedTryTableMetadata) Table() []wazevoapi.TryTableInfo {
 	s.finalized = true
 	return s.table
 }
 
-// WithCatchClauseTable replaces the catch clause table implementation.
-// Used by the parallel compilation path to share a single mutex-protected
-// table across workers.
-func (c *Compiler) WithCatchClauseTable(t catchClauseTable) *Compiler {
-	c.catchClauseTable = t
+// WithTryTableMetadata replaces the try_table metadata table implementation.
+func (c *Compiler) WithTryTableMetadata(t tryTableMetadata) *Compiler {
+	c.tryTableMetadata = t
 	return c
 }
 
-// CatchClauseTable returns the accumulated catch clause table.
-func (c *Compiler) CatchClauseTable() [][]wazevoapi.CatchClauseInstance {
-	return c.catchClauseTable.Table()
+// TryTableMetadata returns the accumulated try_table metadata.
+func (c *Compiler) TryTableMetadata() []wazevoapi.TryTableInfo {
+	return c.tryTableMetadata.Table()
 }
 
 func (c *Compiler) declareSignatures(listenerOn bool) {
@@ -300,6 +307,13 @@ func (c *Compiler) declareSignatures(listenerOn bool) {
 		Results: []ssa.Type{},
 	}
 	c.ssaBuilder.DeclareSignature(&c.tryTableLeaveSig)
+
+	c.memclrSig = ssa.Signature{
+		ID: c.tryTableLeaveSig.ID + 1,
+		// ptr and the byte count.
+		Params: []ssa.Type{ssa.TypeI64, ssa.TypeI64},
+	}
+	c.ssaBuilder.DeclareSignature(&c.memclrSig)
 }
 
 // SignatureForWasmFunctionType returns the ssa.Signature for the given wasm.FunctionType.
@@ -332,6 +346,7 @@ func (c *Compiler) Init(idx, typIndex wasm.Index, typ *wasm.FunctionType, localT
 	c.wasmFunctionBody = body
 	c.wasmFunctionBodyOffsetInCodeSection = bodyOffsetInCodeSection
 	c.needListener = needListener
+	c.tryTableDepth = 0
 	c.clearSafeBounds()
 	c.varLengthKnownSafeBoundWithIDPool.Reset()
 	c.knownSafeBoundsAtTheEndOfBlocks = c.knownSafeBoundsAtTheEndOfBlocks[:0]
@@ -415,10 +430,14 @@ func (c *Compiler) declareWasmLocals() {
 func (c *Compiler) declareNecessaryVariables() {
 	if c.needMemory = c.m.MemorySection != nil; c.needMemory {
 		c.memoryShared = c.m.MemorySection.IsShared
+		c.memoryMinSizeInBytes = uint64(c.m.MemorySection.Min) * uint64(wasm.MemoryPageSize)
 	} else if c.needMemory = c.m.ImportMemoryCount > 0; c.needMemory {
 		for _, imp := range c.m.ImportSection {
 			if imp.Type == wasm.ExternTypeMemory {
 				c.memoryShared = imp.DescMem.IsShared
+				// The import's minimum is a type constraint on the provided
+				// memory, so it is a valid static lower bound as well.
+				c.memoryMinSizeInBytes = uint64(imp.DescMem.Min) * uint64(wasm.MemoryPageSize)
 				break
 			}
 		}

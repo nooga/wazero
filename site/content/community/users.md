@@ -12,8 +12,7 @@ considering their efforts before starting your own!
 
 | Name             | Description                                                                                          |
 |:-----------------|------------------------------------------------------------------------------------------------------|
-| [go-pdfium][23]  | [PDFium][24] bindings to do PDF operations in Go, also available as end application [pdfium-cli][25] |
-| [go-re2][7]      | high performance regular expressions                                                                 |
+| [go-pdfium][23]  | [PDFium][24] bindings to do PDF operations in Go, also available as end application [pdfium-cli][25] |                                                    |
 | [wasi-go][33]    | WASI host module for Wazero with experimental support for socket extensions                          |
 | [wazergo][29]    | Generics library for type-safe and high performance wazero host modules                              |
 | [Wetware][28]    | Simple, secure & scalable clusters                                                                   |
@@ -34,6 +33,7 @@ considering their efforts before starting your own!
 | [go-plugin][2]                 | implements [Protocol Buffers][8] services with WebAssembly vi code generation |
 | [waPC][5]                      | implements [Apex][6] interfaces with WebAssembly via code generation          |
 | [wazero-emscripten-embind][36] | Emscripten [Embind][37] and code generation support for Wazero                |
+| [f4][51]                       | Far Manager clone in Go using wazero for plug-in system                       |
 
 ### Infrastructure-as-Code
 
@@ -78,7 +78,12 @@ considering their efforts before starting your own!
 | Name          | Description                              |
 |:--------------|------------------------------------------|
 | [wescale][44] | a database proxy that supports OnlineDDL |
+| [Renart](https://github.com/renart-data/renart) | Data platform that embeds Python type checking in Go via wazero |
 
+### Transpilation
+| Name              | Description                                 |
+|:------------------|---------------------------------------------|
+| [colorer4go][50]  | Far Manager colorer plugin ported via wasm  |
 
 ## Updating this list
 
@@ -182,3 +187,7 @@ experience.
 [48]: https://github.com/klippa-app/go-libtiff
 
 [49]: https://libtiff.gitlab.io/libtiff/
+
+[50]: https://github.com/unxed/colorer4go
+
+[51]: https://github.com/unxed/f4

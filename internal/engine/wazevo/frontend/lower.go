@@ -66,6 +66,7 @@ const (
 	controlFrameKindIfWithoutElse
 	controlFrameKindBlock
 	controlFrameKindTryTable
+	controlFrameKindTryTableWithCatch
 )
 
 // String implements fmt.Stringer for debugging.
@@ -83,6 +84,8 @@ func (k controlFrameKind) String() string {
 		return "block"
 	case controlFrameKindTryTable:
 		return "try_table"
+	case controlFrameKindTryTableWithCatch:
+		return "try_table_with_catch"
 	default:
 		panic(k)
 	}
@@ -91,6 +94,10 @@ func (k controlFrameKind) String() string {
 // isLoop returns true if this is a loop frame.
 func (ctrl *controlFrame) isLoop() bool {
 	return ctrl.kind == controlFrameKindLoop
+}
+
+func (ctrl *controlFrame) isTryCatch() bool {
+	return ctrl.kind == controlFrameKindTryTableWithCatch
 }
 
 // reset resets the state of loweringState for reuse.
@@ -738,65 +745,128 @@ func (c *Compiler) lowerCurrentOpcode() {
 			// Calculate the base address:
 			addr := builder.AllocateInstruction().AsIadd(c.getMemoryBaseValue(false), offset).Insert(builder).Return()
 
-			// Uses the copy trick for faster filling buffer, with a maximum chunk size of 8KB.
-			// https://github.com/golang/go/blob/go1.24.0/src/bytes/bytes.go#L664-L673
+			// Fill the region with inline 128-bit stores of the splat byte
+			// pattern: a 64-bytes-per-iteration main loop, a 16-byte loop for
+			// the remainder, and a byte tail. Large zero fills (the dominant
+			// case in practice: buffer clearing) are dispatched to the Go
+			// runtime's memclrNoHeapPointers, which uses the widest stores
+			// the platform has and non-temporal stores for very large sizes.
 			//
-			// 	buf := memoryInst.Buffer[offset : offset+fillSize]
-			// 	buf[0] = value
-			// 	for i := 1; i < fillSize; {
-			// 		chunk := ((i - 1) & 8191) + 1
-			// 		copy(buf[i:], buf[:chunk])
-			// 		i += chunk
+			// 	if fillSize >= 64 {
+			// 		if fillSize >= 1024 && (value&0xff) == 0 {
+			// 			memclr(addr, fillSize); goto done
+			// 		}
 			// 	}
+			// 	pattern := i8x16.splat(value)
+			// 	i := 0
+			// 	for ; i+64 <= fillSize; i += 64 { store128x4(addr+i, pattern) }
+			// 	for ; i+16 <= fillSize; i += 16 { store128(addr+i, pattern) }
+			// 	for ; i < fillSize; i++ { store8(addr+i, value) }
 
-			// Prepare the loop and following block.
-			beforeLoop := builder.AllocateBasicBlock()
-			loopBlk := builder.AllocateBasicBlock()
-			loopVar := loopBlk.AddParam(builder, ssa.TypeI64)
+			gateBlk := builder.AllocateBasicBlock()
+			memclrBlk := builder.AllocateBasicBlock()
+			mainLoopBlk := builder.AllocateBasicBlock()
+			mainLoopVar := mainLoopBlk.AddParam(builder, ssa.TypeI64)
+			midLoopBlk := builder.AllocateBasicBlock()
+			midLoopVar := midLoopBlk.AddParam(builder, ssa.TypeI64)
+			midBodyBlk := builder.AllocateBasicBlock()
+			tailLoopBlk := builder.AllocateBasicBlock()
+			tailLoopVar := tailLoopBlk.AddParam(builder, ssa.TypeI64)
+			tailBodyBlk := builder.AllocateBasicBlock()
 			followingBlk := builder.AllocateBasicBlock()
 
-			// Insert the jump to the beforeLoop block; If the fillSize is zero, then jump to the following block to skip entire logics.
+			// The 128-bit splat pattern, used by all inline store paths.
+			pattern := builder.AllocateInstruction().AsSplat(value, ssa.VecLaneI8x16).Insert(builder).Return()
+
 			zero := builder.AllocateInstruction().AsIconst64(0).Insert(builder).Return()
-			ifFillSizeZero := builder.AllocateInstruction().AsIcmp(fillSize, zero, ssa.IntegerCmpCondEqual).
-				Insert(builder).Return()
-			builder.AllocateInstruction().AsBrnz(ifFillSizeZero, ssa.ValuesNil, followingBlk).Insert(builder)
-			c.insertJumpToBlock(ssa.ValuesNil, beforeLoop)
+			sixtyFour := builder.AllocateInstruction().AsIconst64(64).Insert(builder).Return()
 
-			// buf[0] = value
-			builder.SetCurrentBlock(beforeLoop)
-			builder.AllocateInstruction().AsStore(ssa.OpcodeIstore8, value, addr, 0).Insert(builder)
-			one := builder.AllocateInstruction().AsIconst64(1).Insert(builder).Return()
-			c.insertJumpToBlock(c.allocateVarLengthValues(1, one), loopBlk)
-
-			builder.SetCurrentBlock(loopBlk)
-			dstAddr := builder.AllocateInstruction().AsIadd(addr, loopVar).Insert(builder).Return()
-
-			// chunk := ((i - 1) & 8191) + 1
-			mask := builder.AllocateInstruction().AsIconst64(8191).Insert(builder).Return()
-			tmp1 := builder.AllocateInstruction().AsIsub(loopVar, one).Insert(builder).Return()
-			tmp2 := builder.AllocateInstruction().AsBand(tmp1, mask).Insert(builder).Return()
-			chunk := builder.AllocateInstruction().AsIadd(tmp2, one).Insert(builder).Return()
-
-			// i += chunk
-			newLoopVar := builder.AllocateInstruction().AsIadd(loopVar, chunk).Insert(builder).Return()
-			newLoopVarLessThanFillSize := builder.AllocateInstruction().
-				AsIcmp(newLoopVar, fillSize, ssa.IntegerCmpCondUnsignedLessThan).Insert(builder).Return()
-
-			// count = min(chunk, fillSize-loopVar)
-			diff := builder.AllocateInstruction().AsIsub(fillSize, loopVar).Insert(builder).Return()
-			count := builder.AllocateInstruction().AsSelect(newLoopVarLessThanFillSize, chunk, diff).Insert(builder).Return()
-
-			c.callMemmove(dstAddr, addr, count)
-
+			// Small fills (including zero-length) go straight to the 16-byte
+			// loop, which falls through to the byte tail.
+			fillSizeLessThan64 := builder.AllocateInstruction().
+				AsIcmp(fillSize, sixtyFour, ssa.IntegerCmpCondUnsignedLessThan).Insert(builder).Return()
 			builder.AllocateInstruction().
-				AsBrnz(newLoopVarLessThanFillSize, c.allocateVarLengthValues(1, newLoopVar), loopBlk).
+				AsBrnz(fillSizeLessThan64, c.allocateVarLengthValues(1, zero), midLoopBlk).
 				Insert(builder)
+			c.insertJumpToBlock(ssa.ValuesNil, gateBlk)
 
+			// gate: large zero fills to memclr, everything else inline.
+			builder.SetCurrentBlock(gateBlk)
+			valueU64 := builder.AllocateInstruction().AsUExtend(value, 32, 64).Insert(builder).Return()
+			ff := builder.AllocateInstruction().AsIconst64(0xff).Insert(builder).Return()
+			valueByte := builder.AllocateInstruction().AsBand(valueU64, ff).Insert(builder).Return()
+			valueIsZero := builder.AllocateInstruction().
+				AsIcmp(valueByte, zero, ssa.IntegerCmpCondEqual).Insert(builder).Return()
+			kilo := builder.AllocateInstruction().AsIconst64(1024).Insert(builder).Return()
+			fillSizeBig := builder.AllocateInstruction().
+				AsIcmp(fillSize, kilo, ssa.IntegerCmpCondUnsignedGreaterThanOrEqual).Insert(builder).Return()
+			useMemclr := builder.AllocateInstruction().AsBand(valueIsZero, fillSizeBig).Insert(builder).Return()
+			builder.AllocateInstruction().
+				AsBrnz(useMemclr, ssa.ValuesNil, memclrBlk).
+				Insert(builder)
+			c.insertJumpToBlock(c.allocateVarLengthValues(1, zero), mainLoopBlk)
+
+			builder.SetCurrentBlock(memclrBlk)
+			c.callMemclr(addr, fillSize)
 			c.insertJumpToBlock(ssa.ValuesNil, followingBlk)
+
+			// Main loop: four 16-byte stores per iteration. Only entered
+			// while mainLoopVar+64 <= fillSize, so the stores stay within the
+			// bounds-checked region.
+			builder.SetCurrentBlock(mainLoopBlk)
+			mainDst := builder.AllocateInstruction().AsIadd(addr, mainLoopVar).Insert(builder).Return()
+			builder.AllocateInstruction().AsStore(ssa.OpcodeStore, pattern, mainDst, 0).Insert(builder)
+			builder.AllocateInstruction().AsStore(ssa.OpcodeStore, pattern, mainDst, 16).Insert(builder)
+			builder.AllocateInstruction().AsStore(ssa.OpcodeStore, pattern, mainDst, 32).Insert(builder)
+			builder.AllocateInstruction().AsStore(ssa.OpcodeStore, pattern, mainDst, 48).Insert(builder)
+			newMainLoopVar := builder.AllocateInstruction().AsIadd(mainLoopVar, sixtyFour).Insert(builder).Return()
+			nextMainCeil := builder.AllocateInstruction().AsIadd(newMainLoopVar, sixtyFour).Insert(builder).Return()
+			canContinueMain := builder.AllocateInstruction().
+				AsIcmp(nextMainCeil, fillSize, ssa.IntegerCmpCondUnsignedLessThanOrEqual).Insert(builder).Return()
+			builder.AllocateInstruction().
+				AsBrnz(canContinueMain, c.allocateVarLengthValues(1, newMainLoopVar), mainLoopBlk).
+				Insert(builder)
+			c.insertJumpToBlock(c.allocateVarLengthValues(1, newMainLoopVar), midLoopBlk)
+
+			// 16-byte loop header: run the body while midLoopVar+16 <= fillSize.
+			builder.SetCurrentBlock(midLoopBlk)
+			sixteen := builder.AllocateInstruction().AsIconst64(16).Insert(builder).Return()
+			midCeil := builder.AllocateInstruction().AsIadd(midLoopVar, sixteen).Insert(builder).Return()
+			midDone := builder.AllocateInstruction().
+				AsIcmp(midCeil, fillSize, ssa.IntegerCmpCondUnsignedGreaterThan).Insert(builder).Return()
+			builder.AllocateInstruction().
+				AsBrnz(midDone, c.allocateVarLengthValues(1, midLoopVar), tailLoopBlk).
+				Insert(builder)
+			c.insertJumpToBlock(ssa.ValuesNil, midBodyBlk)
+
+			builder.SetCurrentBlock(midBodyBlk)
+			midDst := builder.AllocateInstruction().AsIadd(addr, midLoopVar).Insert(builder).Return()
+			builder.AllocateInstruction().AsStore(ssa.OpcodeStore, pattern, midDst, 0).Insert(builder)
+			c.insertJumpToBlock(c.allocateVarLengthValues(1, midCeil), midLoopBlk)
+
+			// Byte tail loop header: exit when tailLoopVar reaches fillSize.
+			builder.SetCurrentBlock(tailLoopBlk)
+			tailDone := builder.AllocateInstruction().
+				AsIcmp(tailLoopVar, fillSize, ssa.IntegerCmpCondUnsignedGreaterThanOrEqual).Insert(builder).Return()
+			builder.AllocateInstruction().AsBrnz(tailDone, ssa.ValuesNil, followingBlk).Insert(builder)
+			c.insertJumpToBlock(ssa.ValuesNil, tailBodyBlk)
+
+			builder.SetCurrentBlock(tailBodyBlk)
+			tailDst := builder.AllocateInstruction().AsIadd(addr, tailLoopVar).Insert(builder).Return()
+			builder.AllocateInstruction().AsStore(ssa.OpcodeIstore8, value, tailDst, 0).Insert(builder)
+			one := builder.AllocateInstruction().AsIconst64(1).Insert(builder).Return()
+			newTailLoopVar := builder.AllocateInstruction().AsIadd(tailLoopVar, one).Insert(builder).Return()
+			c.insertJumpToBlock(c.allocateVarLengthValues(1, newTailLoopVar), tailLoopBlk)
+
 			builder.SetCurrentBlock(followingBlk)
 
-			builder.Seal(beforeLoop)
-			builder.Seal(loopBlk)
+			builder.Seal(gateBlk)
+			builder.Seal(memclrBlk)
+			builder.Seal(mainLoopBlk)
+			builder.Seal(midLoopBlk)
+			builder.Seal(midBodyBlk)
+			builder.Seal(tailLoopBlk)
+			builder.Seal(tailBodyBlk)
 			builder.Seal(followingBlk)
 
 		case wasm.OpcodeMiscMemoryInit:
@@ -1096,6 +1166,9 @@ func (c *Compiler) lowerCurrentOpcode() {
 		variable := c.localVariable(index)
 		newValue := state.pop()
 		builder.DefineVariableInCurrentBB(variable, newValue)
+		if c.tryTableDepth > 0 {
+			c.storeLocalToSaveArea(wasm.Index(index), newValue)
+		}
 
 	case wasm.OpcodeLocalTee:
 		index := c.readI32u()
@@ -1105,6 +1178,9 @@ func (c *Compiler) lowerCurrentOpcode() {
 		variable := c.localVariable(index)
 		newValue := state.peek()
 		builder.DefineVariableInCurrentBB(variable, newValue)
+		if c.tryTableDepth > 0 {
+			c.storeLocalToSaveArea(wasm.Index(index), newValue)
+		}
 
 	case wasm.OpcodeSelect, wasm.OpcodeTypedSelect:
 		if op == wasm.OpcodeTypedSelect {
@@ -1446,8 +1522,10 @@ func (c *Compiler) lowerCurrentOpcode() {
 
 		unreachable := state.unreachable
 		if !unreachable {
-			// For try_table, emit the leave trampoline before the jump to the following block.
-			if ctrl.kind == controlFrameKindTryTable {
+			// For try_table with catch clauses, emit the leave trampoline
+			// before the jump to the following block. If there are no catch clauses,
+			// skip since they never pushed a handler.
+			if ctrl.isTryCatch() {
 				c.emitTryTableLeave()
 			}
 
@@ -1472,6 +1550,10 @@ func (c *Compiler) lowerCurrentOpcode() {
 			elseBlk := ctrl.blk
 			builder.SetCurrentBlock(elseBlk)
 			c.insertJumpToBlock(ctrl.clonedArgs, followingBlk)
+		case controlFrameKindTryTableWithCatch:
+			if c.tryTableDepth > 0 {
+				c.tryTableDepth--
+			}
 		}
 
 		builder.Seal(followingBlk)
@@ -3563,7 +3645,7 @@ func (c *Compiler) lowerCurrentOpcode() {
 			catchClauses = append(catchClauses, catchClause{kind: kind, tagIndex: tagIdx, labelIdx: labelIdx})
 		}
 
-		// Register catch clauses in the table and get the try_table ID.
+		// Register try_table metadata and get the try_table ID.
 		var clauseInstances []wazevoapi.CatchClauseInstance
 		for _, cc := range catchClauses {
 			clauseInstances = append(clauseInstances, wazevoapi.CatchClauseInstance{
@@ -3571,7 +3653,12 @@ func (c *Compiler) lowerCurrentOpcode() {
 				TagIndex: cc.tagIndex,
 			})
 		}
-		tryTableID := c.catchClauseTable.Append(clauseInstances)
+		numLocals := len(c.wasmFunctionTyp.Params) + len(c.wasmFunctionLocalTypes)
+		tryTableID := c.tryTableMetadata.Append(wazevoapi.TryTableInfo{
+			CatchClauses: clauseInstances,
+			NumLocals:    numLocals,
+			ReuseLocals:  c.tryTableDepth > 0,
+		})
 
 		// Allocate the following block (after try_table end) and body block.
 		followingBlk := builder.AllocateBasicBlock()
@@ -3595,6 +3682,7 @@ func (c *Compiler) lowerCurrentOpcode() {
 				handlerBlk := builder.AllocateBasicBlock()
 				builder.SetCurrentBlock(handlerBlk)
 				c.reloadAfterCall()
+				c.reloadLocalsFromSaveArea()
 
 				// Resolve the wasm target label.
 				targetBlk, _ := state.brTargetArgNumFor(cc.labelIdx)
@@ -3616,6 +3704,9 @@ func (c *Compiler) lowerCurrentOpcode() {
 				case wasm.CatchKindCatchAllRef:
 					brArgs = append(brArgs, c.loadExnRef())
 				}
+
+				// Pop any enclosing try_table handlers that the jump crosses.
+				c.emitTryTableLeaves(int(cc.labelIdx))
 
 				jmpArgs := c.allocateVarLengthValues(len(brArgs), brArgs...)
 				c.insertJumpToBlock(jmpArgs, targetBlk)
@@ -3676,11 +3767,19 @@ func (c *Compiler) lowerCurrentOpcode() {
 		if len(catchClauses) > 0 {
 			// Body block is entered after the trampoline call, so we need to reload.
 			c.reloadAfterCall()
+			// Initialize the locals save area so handlers can read
+			// correct values after a stack restore.
+			c.storeAllLocalsToSaveArea()
+			c.tryTableDepth++
 		}
 
 		// Push the try_table control frame AFTER resolving catch labels.
+		kind := controlFrameKind(controlFrameKindTryTable)
+		if len(catchClauses) > 0 {
+			kind = controlFrameKindTryTableWithCatch
+		}
 		state.ctrlPush(controlFrame{
-			kind:                         controlFrameKindTryTable,
+			kind:                         kind,
 			originalStackLenWithoutParam: len(state.values) - len(bt.Params),
 			followingBlock:               followingBlk,
 			blockType:                    bt,
@@ -4247,6 +4346,25 @@ func (c *Compiler) memOpSetup(baseAddr ssa.Value, constOffset, operationSizeInBy
 		}
 	}
 
+	// A constant base address whose access end lies within the memory's
+	// minimum size can never be out of bounds: memories only ever grow, so
+	// the declared minimum is a static lower bound on the current length.
+	if def := builder.InstructionOfValue(baseAddr); def != nil && def.Constant() {
+		if uint64(uint32(def.ConstantVal()))+ceil <= c.memoryMinSizeInBytes {
+			if !address.Valid() {
+				memBase := c.getMemoryBaseValue(false)
+				extBaseAddr := builder.AllocateInstruction().
+					AsUExtend(baseAddr, 32, 64).
+					Insert(builder).
+					Return()
+				address = builder.AllocateInstruction().
+					AsIadd(memBase, extBaseAddr).Insert(builder).Return()
+			}
+			c.recordKnownSafeBound(baseAddrID, ceil, address)
+			return
+		}
+	}
+
 	ceilConst := builder.AllocateInstruction()
 	ceilConst.AsIconst64(ceil)
 	builder.InsertInstruction(ceilConst)
@@ -4340,6 +4458,20 @@ func (c *Compiler) callMemmove(dst, src, size ssa.Value) {
 			ssa.TypeI64,
 		).Insert(builder).Return()
 	builder.AllocateInstruction().AsCallGoRuntimeMemmove(memmovePtr, &c.memmoveSig, args).Insert(builder)
+}
+
+// callMemclr emits a call to the Go runtime's memclrNoHeapPointers through
+// the same mechanism as callMemmove (the isMemmove call handling also covers
+// memclr: both may clobber every vector register).
+func (c *Compiler) callMemclr(ptr, size ssa.Value) {
+	args := c.allocateVarLengthValues(2, ptr, size)
+	builder := c.ssaBuilder
+	memclrPtr := builder.AllocateInstruction().
+		AsLoad(c.execCtxPtrValue,
+			wazevoapi.ExecutionContextOffsetMemclrAddress.U32(),
+			ssa.TypeI64,
+		).Insert(builder).Return()
+	builder.AllocateInstruction().AsCallGoRuntimeMemmove(memclrPtr, &c.memclrSig, args).Insert(builder)
 }
 
 func (c *Compiler) reloadAfterCall() {
@@ -4574,6 +4706,64 @@ func (c *Compiler) emitThrow(exnref ssa.Value) {
 	builder.InsertInstruction(exit)
 }
 
+// loadLocalsSaveAreaPtr emits a load of the locals save area pointer from execCtx.
+func (c *Compiler) loadLocalsSaveAreaPtr() ssa.Value {
+	return c.ssaBuilder.AllocateInstruction().
+		AsLoad(c.execCtxPtrValue,
+			wazevoapi.ExecutionContextOffsetLocalsSaveAreaPtr.U32(),
+			ssa.TypeI64).
+		Insert(c.ssaBuilder).Return()
+}
+
+// storeLocalToSaveArea emits a store of the given local value to the
+// heap-allocated locals save area.
+func (c *Compiler) storeLocalToSaveArea(localIdx wasm.Index, val ssa.Value) {
+	ptr := c.loadLocalsSaveAreaPtr()
+	store := c.ssaBuilder.AllocateInstruction()
+	store.AsStore(ssa.OpcodeStore, val, ptr, uint32(localIdx)*16)
+	c.ssaBuilder.InsertInstruction(store)
+}
+
+// reloadLocalsFromSaveArea loads all locals from the heap-allocated save area
+// and redefines the SSA variables, so handler blocks see throw-time values.
+func (c *Compiler) reloadLocalsFromSaveArea() {
+	builder := c.ssaBuilder
+	ptr := c.loadLocalsSaveAreaPtr()
+	numParams := len(c.wasmFunctionTyp.Params)
+	numLocals := numParams + len(c.wasmFunctionLocalTypes)
+	for i := 0; i < numLocals; i++ {
+		localIdx := wasm.Index(i)
+		var wasmType wasm.ValueType
+		if i < numParams {
+			wasmType = c.wasmFunctionTyp.Params[i]
+		} else {
+			wasmType = c.wasmFunctionLocalTypes[i-numParams]
+		}
+		ssaType := WasmTypeToSSAType(wasmType)
+		load := builder.AllocateInstruction()
+		load.AsLoad(ptr, uint32(localIdx)*16, ssaType)
+		builder.InsertInstruction(load)
+		variable := c.localVariable(localIdx)
+		builder.DefineVariableInCurrentBB(variable, load.Return())
+	}
+}
+
+// storeAllLocalsToSaveArea stores all locals to the save area at once.
+func (c *Compiler) storeAllLocalsToSaveArea() {
+	builder := c.ssaBuilder
+	ptr := c.loadLocalsSaveAreaPtr()
+	numParams := len(c.wasmFunctionTyp.Params)
+	numLocals := numParams + len(c.wasmFunctionLocalTypes)
+	for i := 0; i < numLocals; i++ {
+		localIdx := wasm.Index(i)
+		variable := c.localVariable(localIdx)
+		val := builder.MustFindValue(variable)
+		store := builder.AllocateInstruction()
+		store.AsStore(ssa.OpcodeStore, val, ptr, uint32(localIdx)*16)
+		builder.InsertInstruction(store)
+	}
+}
+
 // emitTryTableLeave emits a trampoline call to pop the try handler in the dispatch loop.
 func (c *Compiler) emitTryTableLeave() {
 	builder := c.ssaBuilder
@@ -4592,12 +4782,19 @@ func (c *Compiler) emitTryTableLeave() {
 }
 
 // branchExitsTryTable returns true if a branch to the given depth would
-// exit at least one try_table frame.
+// exit at least one try_table frame that has catch clauses.
 func (c *Compiler) branchExitsTryTable(depth int) bool {
 	state := c.state()
 	tail := len(state.controlFrames) - 1
 	for i := 0; i < depth; i++ {
-		if state.controlFrames[tail-i].kind == controlFrameKindTryTable {
+		if state.controlFrames[tail-i].isTryCatch() {
+			return true
+		}
+	}
+	// A br to a non-loop target also exits that frame.
+	if depth <= tail {
+		cf := &state.controlFrames[tail-depth]
+		if !cf.isLoop() && cf.isTryCatch() {
 			return true
 		}
 	}
@@ -4605,12 +4802,19 @@ func (c *Compiler) branchExitsTryTable(depth int) bool {
 }
 
 // emitTryTableLeaves emits TryTableLeave calls for try_table frames
-// that would be exited by a branch to the given depth.
+// with catch clauses that would be exited by a branch to the given depth.
 func (c *Compiler) emitTryTableLeaves(depth int) {
 	state := c.state()
 	tail := len(state.controlFrames) - 1
 	for i := 0; i < depth; i++ {
-		if state.controlFrames[tail-i].kind == controlFrameKindTryTable {
+		if state.controlFrames[tail-i].isTryCatch() {
+			c.emitTryTableLeave()
+		}
+	}
+	// A br to a non-loop target also exits that frame.
+	if depth <= tail {
+		cf := &state.controlFrames[tail-depth]
+		if !cf.isLoop() && cf.isTryCatch() {
 			c.emitTryTableLeave()
 		}
 	}
