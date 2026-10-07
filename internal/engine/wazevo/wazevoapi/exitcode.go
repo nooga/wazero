@@ -49,24 +49,6 @@ const (
 	// ExitCodeTryTableLeave is an exit code for leaving a try_table block.
 	// The dispatch loop pops the most recent try handler.
 	ExitCodeTryTableLeave
-	// ExitCodeShadowStore roots a reference for Go's collector: Go writes
-	// callEngine.refs[slot] = ptr, where slot is relative to the current
-	// frame's shadow base. Compiled code holds references as opaque
-	// integers, which Go's GC cannot see, so every one that enters a frame
-	// is written to a shadow slot that keeps it alive.
-	ExitCodeShadowStore
-	// ExitCodeGlobalRefStore roots a reference a global now holds: Go writes
-	// it to ModuleInstance.GlobalRefs. Compiled code stores the global's
-	// value as raw bytes in the module context, where Go cannot see it, so
-	// the side table is what keeps the object alive once the frame that
-	// produced it is gone.
-	ExitCodeGlobalRefStore
-	// ExitCodeTableRefSync rebuilds a table's Refs side table from its
-	// elements. For a reference-typed table the element is the pointer, so
-	// Go can recover it as long as the object is still alive, which it is
-	// immediately after the write that prompted the sync. One exit covers
-	// table.set and every bulk write; only reference-typed tables use it.
-	ExitCodeTableRefSync
 	exitCodeMax
 )
 
@@ -131,12 +113,6 @@ func (e ExitCode) String() string {
 		return "null_reference"
 	case ExitCodeTryTableEnter:
 		return "try_table_enter"
-	case ExitCodeShadowStore:
-		return "shadow_store"
-	case ExitCodeGlobalRefStore:
-		return "global_ref_store"
-	case ExitCodeTableRefSync:
-		return "table_ref_sync"
 	case ExitCodeTryTableLeave:
 		return "try_table_leave"
 	}
