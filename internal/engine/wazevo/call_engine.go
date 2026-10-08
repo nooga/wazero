@@ -2,7 +2,10 @@ package wazevo
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"runtime"
 	"sync/atomic"
@@ -43,32 +46,14 @@ type (
 		execCtxPtr        uintptr
 		numberOfResults   int
 		stackIteratorImpl stackIterator
+		// heldExceptions is the reference table for exnrefs stored in locals/stack slots.
+		heldExceptions map[wasm.Reference]*wasm.Exception
+		// collectedExceptions is the map collectGarbage fills next, kept empty between
+		// collections so that one does not allocate.
+		collectedExceptions map[wasm.Reference]*wasm.Exception
 		// tryHandlers is the stack of active try_table exception handlers,
 		// used to match catch clauses when a throw exits to the dispatch loop.
 		tryHandlers []tryHandler
-		// pendingException holds the most recently caught exception, so handler
-		// code can read its params after re-entry.
-		pendingException *wasm.Exception
-		// refs is the shadow stack. Compiled code holds references as opaque
-		// integers, which Go's collector cannot see, so every reference that
-		// enters a frame is also written here, keeping the object alive for
-		// as long as the frame owning the slot is live.
-		//
-		//	refs ([]unsafe.Pointer)
-		//	┌──────────────┐
-		//	│ nil          │  <- execCtx.shadowRefsTop
-		//	│ E ───────────┼──► *wasm.Exception   } callee frame
-		//	│ nil          │                      }
-		//	│ E' ──────────┼──► *wasm.Exception   } caller frame
-		//	└──────────────┘
-		//
-		// A frame's prologue bumps shadowRefsTop and its epilogue lowers it;
-		// slots are not cleared on the way out, so a finished frame can leave
-		// one stale pointer per slot. That is bounded and harmless: nothing
-		// reads refs for semantics, and Go's collector does not move objects,
-		// so the integer compiled code holds stays valid. Cleared when the
-		// top-level call returns.
-		refs []unsafe.Pointer
 	}
 
 	// tryHandler records the state at a try_table entry for exception handling.
@@ -91,11 +76,6 @@ type (
 		// Used for tag matching in doHandleException (the tag index in
 		// catch clauses is relative to this module's tag index space).
 		moduleInstance *wasm.ModuleInstance
-		// shadowRefsTop is the shadow stack depth at the try_table entry.
-		// An unwind skips the epilogues of every frame it passes through, so
-		// none of them release their slots; restoring this puts the handler's
-		// slots back at the base its own frame was compiled against.
-		shadowRefsTop uintptr
 	}
 
 	// executionContext is the struct to be read/written by assembly functions.
@@ -152,11 +132,10 @@ type (
 		tryTableEnterTrampolineAddress *byte
 		// tryTableLeaveTrampolineAddress holds the address of the try_table leave trampoline function.
 		tryTableLeaveTrampolineAddress *byte
-		// exceptionPtr holds the pointer to the Exception struct,
-		// used on the throw side (throwAlloc stores the new Exception)
-		// and on the catch side (catch_ref/catch_all_ref retrieve the exnref).
-		exceptionPtr uintptr
-		// exceptionParamsPtr points into exceptionPtr's Params slice
+		// exceptionRef holds the reference to the Exception struct,
+		// used on the catch side (catch_ref/catch_all_ref retrieve the exnref).
+		exceptionRef uintptr
+		// exceptionParamsPtr points into exceptionRef's Params slice
 		// backing array. On the throw side, throwAlloc sets it so compiled
 		// code can store params at [ptr + i*8]. On the catch side, compiled
 		// handler blocks load params from the same pointer.
@@ -172,19 +151,17 @@ type (
 		// memclrAddress holds the address of memclrNoHeapPointers implemented
 		// by the Go runtime. See memclr.go.
 		memclrAddress uintptr
-		// shadowRefsTop is the index just past the current frame's shadow
-		// slots in callEngine.refs, maintained by compiled prologues and
-		// epilogues.
-		shadowRefsTop uintptr
-		// shadowStoreTrampolineAddress holds the address of the shadow-store
-		// trampoline function.
-		shadowStoreTrampolineAddress *byte
-		// globalRefStoreTrampolineAddress holds the address of the
-		// global-ref-store trampoline function.
-		globalRefStoreTrampolineAddress *byte
-		// tableRefSyncTrampolineAddress holds the address of the
-		// table-ref-sync trampoline function.
-		tableRefSyncTrampolineAddress *byte
+		// exnrefSlotLoadTrampolineAddress and exnrefSlotStoreTrampolineAddress hold the
+		// addresses of the barriers an exnref-typed global or table slot is accessed
+		// through. Compiled code passes the address of the slot and lets the runtime do the
+		// access itself, so that it cannot race another barrier on the same slot.
+		exnrefSlotLoadTrampolineAddress  *byte
+		exnrefSlotStoreTrampolineAddress *byte
+		// exnrefSlotFillTrampolineAddress and exnrefSlotCopyTrampolineAddress hold the
+		// addresses of the barriers over a run of exnref-typed table slots, which the bulk
+		// table operations write.
+		exnrefSlotFillTrampolineAddress *byte
+		exnrefSlotCopyTrampolineAddress *byte
 	}
 )
 
@@ -312,9 +289,9 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 		}
 	}
 
-	// Clear any stale try_table handlers and shadow roots from a previous call.
+	// Clear any stale in-flight exception state from a previous call.
 	c.tryHandlers = c.tryHandlers[:0]
-	c.resetShadowRefs()
+	clear(c.heldExceptions)
 
 	var paramResultPtr *uint64
 	if len(paramResultStack) > 0 {
@@ -345,6 +322,7 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 					c.execCtx.framePointerBeforeGoCall,
 					c.stackTop,
 					nil,
+					0,
 				)
 				if len(returnAddrs) > 1 {
 					for _, retAddr := range returnAddrs[:len(returnAddrs)-1] { // the last return addr is the trampoline, so we skip it.
@@ -357,8 +335,10 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 			}
 			err = builder.FromRecovered(r)
 
-			for _, lsn := range listeners {
-				lsn.lsn.Abort(ctx, m, lsn.def, err)
+			if !errors.Is(err, wasmruntime.ErrRuntimeUncaughtException) { // Don't call listeners on an uncaught exception: they will have already been notified as the stack unwound
+				for _, lsn := range listeners {
+					lsn.lsn.Abort(ctx, m, lsn.def, err)
+				}
 			}
 		} else {
 			if err != wasmruntime.ErrRuntimeStackOverflow { // Stackoverflow case shouldn't be panic (to avoid extreme stack unwinding).
@@ -370,7 +350,7 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 			// Ensures that we can reuse this callEngine even after an error.
 			c.execCtx.exitCode = wazevoapi.ExitCodeOK
 			c.tryHandlers = c.tryHandlers[:0]
-			c.resetShadowRefs()
+			clear(c.heldExceptions)
 		}
 	}()
 
@@ -422,8 +402,18 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 			s := goCallStackView(c.execCtx.stackPointerBeforeGoCall)
 			tableIndex, num, ref := uint32(s[0]), uint32(s[1]), uintptr(s[2])
 			table := mod.Tables[tableIndex]
+			before := uint64(len(table.References))
 			s[0] = uint64(uint32(int32(table.Grow(num, ref))))
-			table.SyncRefs()
+			if wasm.IsExnref(table.Type) && ref != 0 {
+				// Grow wrote the new slots already; record one more naming apiece.
+				exn := c.heldExceptions[ref]
+				if exn == nil {
+					panic(wasmruntime.ErrRuntimeExpiredExceptionRef)
+				}
+				for i := before; i < uint64(len(table.References)); i++ {
+					c.parent.parent.parent.exceptions.Retain(exn)
+				}
+			}
 			c.execCtx.exitCode = wazevoapi.ExitCodeOK
 			afterGoFunctionCallEntrypoint(c.execCtx.goCallReturnAddress, c.execCtxPtr,
 				uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall)), c.execCtx.framePointerBeforeGoCall)
@@ -620,13 +610,15 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 			mod := c.callerModuleInstance()
 			tag := mod.Tags[tagIndex]
 			nParams := len(tag.Type.Params)
-			exn := &wasm.Exception{Tag: tag, Params: make([]uint64, nParams)}
-			c.pendingException = exn // GC root: keeps exn alive while compiled code writes params
+			// Before holding the new one: its handle is not anywhere a collection looks yet.
+			c.collectGarbage()
+			exn := c.parent.parent.parent.exceptions.NewException(tag, make([]uint64, nParams), nil)
+			c.holdException(exn)
 			if nParams > 0 {
 				c.execCtx.exceptionParamsPtr = uintptr(unsafe.Pointer(&exn.Params[0]))
 			}
 			// Return the exnref to compiled code via the stack slot.
-			s[0] = uint64(uintptr(unsafe.Pointer(exn)))
+			s[0] = uint64(exn.ID)
 			c.execCtx.exitCode = wazevoapi.ExitCodeOK
 			afterGoFunctionCallEntrypoint(c.execCtx.goCallReturnAddress, c.execCtxPtr,
 				uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall)), c.execCtx.framePointerBeforeGoCall)
@@ -634,40 +626,44 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 			// Throw trampoline: (execCtx, exnref) → ().
 			// Reads the exnref from the stack, searches for a matching handler.
 			s := goCallStackView(c.execCtx.stackPointerBeforeGoCall)
-			// Read the Exception pointer directly from the uint64 value to avoid
-			// conversion from uintptr into unsafe.Pointer, which triggers checkptr.
-			exn := *(**wasm.Exception)(unsafe.Pointer(&s[0]))
-			if !c.doHandleException(exn) {
+			if s[0] == 0 {
+				panic(wasmruntime.ErrRuntimeNullReference)
+			}
+			exn := c.heldExceptions[wasm.Reference(s[0])]
+			if exn == nil {
+				panic(wasmruntime.ErrRuntimeExpiredExceptionRef)
+			}
+			// Resolve all handles to pointers carried by this exception to protect them
+			// from garbage collection - we have to do this now instead of at throwAlloc
+			// because at throwAlloc time the parameters are not yet written into exn.Params
+			if exn.ParamRefs == nil {
+				// initialize ParamRefs even if there are no ref params so the next time this
+				// exn is thrown we don't repeat this.
+				exn.ParamRefs = make([]*wasm.Exception, 0, 1)
+				for i, param := range exn.Tag.Type.Params {
+					if wasm.IsExnref(param) && exn.Params[i] != 0 {
+						exn.ParamRefs = append(exn.ParamRefs, c.heldExceptions[wasm.Reference(exn.Params[i])])
+					}
+				}
+			}
+
+			if !c.doHandleException(ctx, exn) {
+				currentTrace := unwindStack(
+					uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall)),
+					c.execCtx.framePointerBeforeGoCall,
+					c.stackTop,
+					nil,
+					0,
+				)
+				for _, addr := range currentTrace {
+					c.notifyAbortListenerOf(ctx, addr)
+				}
 				panic(wasmruntime.ErrRuntimeUncaughtException)
 			}
 			if len(exn.Params) > 0 {
 				c.execCtx.exceptionParamsPtr = uintptr(unsafe.Pointer(&exn.Params[0]))
 			}
-			c.execCtx.exceptionPtr = uintptr(unsafe.Pointer(exn))
-			c.execCtx.exitCode = wazevoapi.ExitCodeOK
-			afterGoFunctionCallEntrypoint(c.execCtx.goCallReturnAddress, c.execCtxPtr,
-				uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall)), c.execCtx.framePointerBeforeGoCall)
-		case wazevoapi.ExitCodeShadowStore:
-			// Shadow store: (execCtx, slot, ptr) -> (). slot is relative to
-			// the frame's shadow base, so the absolute index sits below
-			// shadowRefsTop. Reading the pointer through the stack word
-			// avoids a uintptr conversion, which would trip checkptr.
-			s := goCallStackView(c.execCtx.stackPointerBeforeGoCall)
-			c.setShadowRef(int(s[0]), *(*unsafe.Pointer)(unsafe.Pointer(&s[1])))
-			c.execCtx.exitCode = wazevoapi.ExitCodeOK
-			afterGoFunctionCallEntrypoint(c.execCtx.goCallReturnAddress, c.execCtxPtr,
-				uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall)), c.execCtx.framePointerBeforeGoCall)
-		case wazevoapi.ExitCodeGlobalRefStore:
-			// Global ref store: (execCtx, globalIndex, ptr) -> ().
-			s := goCallStackView(c.execCtx.stackPointerBeforeGoCall)
-			c.callerModuleInstance().SetGlobalRef(wasm.Index(s[0]), *(*unsafe.Pointer)(unsafe.Pointer(&s[1])))
-			c.execCtx.exitCode = wazevoapi.ExitCodeOK
-			afterGoFunctionCallEntrypoint(c.execCtx.goCallReturnAddress, c.execCtxPtr,
-				uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall)), c.execCtx.framePointerBeforeGoCall)
-		case wazevoapi.ExitCodeTableRefSync:
-			// Table ref sync: (execCtx, tableIndex) -> ().
-			s := goCallStackView(c.execCtx.stackPointerBeforeGoCall)
-			c.callerModuleInstance().Tables[uint32(s[0])].SyncRefs()
+			c.execCtx.exceptionRef = uintptr(exn.ID)
 			c.execCtx.exitCode = wazevoapi.ExitCodeOK
 			afterGoFunctionCallEntrypoint(c.execCtx.goCallReturnAddress, c.execCtxPtr,
 				uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall)), c.execCtx.framePointerBeforeGoCall)
@@ -706,7 +702,6 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 				catchClauses:   info.CatchClauses,
 				moduleInstance: mod,
 				localsSaveArea: saveArea,
-				shadowRefsTop:  c.execCtx.shadowRefsTop,
 			})
 			// Set clauseIdx = -1 (no exception) in execCtx for the compiled code
 			// to read after the trampoline returns.
@@ -724,6 +719,63 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 			c.execCtx.exitCode = wazevoapi.ExitCodeOK
 			afterGoFunctionCallEntrypoint(c.execCtx.goCallReturnAddress, c.execCtxPtr,
 				uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall)), c.execCtx.framePointerBeforeGoCall)
+		case wazevoapi.ExitCodeExnrefSlotFill:
+			// (execCtx, slot address, exnref, count): every slot the fill covers becomes a
+			// durable holder of what it now names, and stops being one for what it held.
+			s := goCallStackView(c.execCtx.stackPointerBeforeGoCall)
+			slots := *(**wasm.Reference)(unsafe.Pointer(&s[0]))
+			handle, count := wasm.Reference(s[1]), s[2]
+			exn := c.heldExceptions[handle]
+			if exn == nil && handle != 0 {
+				panic(wasmruntime.ErrRuntimeExpiredExceptionRef)
+			}
+			stride := unsafe.Sizeof(wasm.Reference(0))
+			for i := uint64(0); i < count; i++ {
+				target := (*wasm.Reference)(unsafe.Add(unsafe.Pointer(slots), uintptr(i)*stride))
+				c.parent.parent.parent.exceptions.StoreSlot(target, exn)
+			}
+			c.execCtx.exitCode = wazevoapi.ExitCodeOK
+			afterGoFunctionCallEntrypoint(c.execCtx.goCallReturnAddress, c.execCtxPtr,
+				uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall)), c.execCtx.framePointerBeforeGoCall)
+		case wazevoapi.ExitCodeExnrefSlotCopy:
+			// (execCtx, destination address, source address, count), for table.copy and
+			// table.init. The source is snapshotted first: the runs may overlap, and each
+			// write releases what the destination slot held.
+			s := goCallStackView(c.execCtx.stackPointerBeforeGoCall)
+			dst := *(**wasm.Reference)(unsafe.Pointer(&s[0]))
+			src := *(**wasm.Reference)(unsafe.Pointer(&s[1]))
+			count := s[2]
+			moved := make([]wasm.Reference, count)
+			stride := unsafe.Sizeof(wasm.Reference(0))
+			for i := range moved {
+				moved[i] = *(*wasm.Reference)(unsafe.Add(unsafe.Pointer(src), uintptr(i)*stride))
+			}
+			for i := range moved {
+				c.parent.parent.parent.exceptions.CopySlot(
+					(*wasm.Reference)(unsafe.Add(unsafe.Pointer(dst), uintptr(i)*stride)), &moved[i])
+			}
+			c.execCtx.exitCode = wazevoapi.ExitCodeOK
+			afterGoFunctionCallEntrypoint(c.execCtx.goCallReturnAddress, c.execCtxPtr,
+				uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall)), c.execCtx.framePointerBeforeGoCall)
+		case wazevoapi.ExitCodeExnrefSlotLoad:
+			// Read barrier: (execCtx, slot address) → exnref. What the slot names becomes
+			// reachable from this call, so it is held before compiled code gets the handle.
+			s := goCallStackView(c.execCtx.stackPointerBeforeGoCall)
+			// Through a double pointer: a uintptr→unsafe.Pointer conversion trips checkptr.
+			slot := *(**wasm.Reference)(unsafe.Pointer(&s[0]))
+			s[0] = uint64(c.loadExnrefSlot(slot))
+			c.execCtx.exitCode = wazevoapi.ExitCodeOK
+			afterGoFunctionCallEntrypoint(c.execCtx.goCallReturnAddress, c.execCtxPtr,
+				uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall)), c.execCtx.framePointerBeforeGoCall)
+		case wazevoapi.ExitCodeExnrefSlotStore:
+			// Write barrier: (execCtx, slot address, exnref). The slot becomes a durable
+			// holder of what it names and stops being one for what it held.
+			s := goCallStackView(c.execCtx.stackPointerBeforeGoCall)
+			slot := *(**wasm.Reference)(unsafe.Pointer(&s[0]))
+			c.storeExnrefSlot(slot, wasm.Reference(s[1]))
+			c.execCtx.exitCode = wazevoapi.ExitCodeOK
+			afterGoFunctionCallEntrypoint(c.execCtx.goCallReturnAddress, c.execCtxPtr,
+				uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall)), c.execCtx.framePointerBeforeGoCall)
 		default:
 			panic("BUG")
 		}
@@ -734,7 +786,7 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 // If a match is found, it restores the execution state to the handler's checkpoint
 // (like snapshot.doRestore) and writes the matched clause index as the trampoline
 // return value. Returns true if handled.
-func (c *callEngine) doHandleException(exn *wasm.Exception) bool {
+func (c *callEngine) doHandleException(ctx context.Context, exn *wasm.Exception) bool {
 	// Search try handlers from innermost (last) to outermost (first).
 	for i := len(c.tryHandlers) - 1; i >= 0; i-- {
 		h := &c.tryHandlers[i]
@@ -743,26 +795,39 @@ func (c *callEngine) doHandleException(exn *wasm.Exception) bool {
 			// because clause.TagIndex is relative to that module's tag space.
 			mod := h.moduleInstance
 			matched := false
+			refExnParams := false
 			switch clause.Kind {
 			case wasm.CatchKindCatch, wasm.CatchKindCatchRef:
 				matched = mod.Tags[clause.TagIndex] == exn.Tag
+				refExnParams = true
 			case wasm.CatchKindCatchAll, wasm.CatchKindCatchAllRef:
 				matched = true
 			}
 			if matched {
+				if refExnParams {
+					// hold any parameter references as they can now be dereferenced from wasm
+					for _, exn := range exn.ParamRefs {
+						c.holdException(exn)
+					}
+				}
+
+				// capture the stack before the unwind
+				currentTrace := unwindStack(
+					uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall)),
+					c.execCtx.framePointerBeforeGoCall,
+					c.stackTop,
+					nil,
+					0,
+				)
+
 				// Restore localsSaveAreaPtr from the matched handler or
 				// the nearest enclosing one (same-function reuse).
 				c.restoreLocalsSaveAreaPtr(i)
 
-				// Pop all handlers at and above this one.
-				c.tryHandlers = c.tryHandlers[:i]
-
-				// Store the caught exception so handler code can read params.
-				c.pendingException = exn
-
-				// Frames unwound by the raise never ran their epilogues, so
-				// the shadow stack is still as deep as it was at the throw.
-				c.execCtx.shadowRefsTop = h.shadowRefsTop
+				// Pop the handlers above this one: the exception unwound their try_tables.
+				// This one stays until its dispatch stub, which is still inside the try_table,
+				// has reloaded the locals from its save area and leaves it like any other exit.
+				c.tryHandlers = c.tryHandlers[:i+1]
 
 				// Restore the cloned stack (like snapshot.doRestore).
 				spp := *(**uint64)(unsafe.Pointer(&h.sp))
@@ -777,6 +842,22 @@ func (c *callEngine) doHandleException(exn *wasm.Exception) bool {
 
 				// Set the matched clause index in execCtx for compiled code to read.
 				ec.caughtExceptionClauseIdx = int64(clauseIdx)
+
+				// capture the stack after the unwind
+				restoredTrace := unwindStack(
+					uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall)),
+					c.execCtx.framePointerBeforeGoCall,
+					c.stackTop,
+					nil,
+					0,
+				)
+
+				// If we skipped frames while unwinding, notify the listeners of any aborted functions
+				if len(currentTrace) > len(restoredTrace) {
+					for _, addr := range currentTrace[:len(currentTrace)-len(restoredTrace)] {
+						c.notifyAbortListenerOf(ctx, addr)
+					}
+				}
 				return true
 			}
 		}
@@ -787,36 +868,6 @@ func (c *callEngine) doHandleException(exn *wasm.Exception) bool {
 // restoreLocalsSaveAreaPtr walks tryHandlers from index `from` downward
 // and sets localsSaveAreaPtr to the first handler that owns a save area,
 // or clears it if none is found.
-// setShadowRef roots p in the current frame's shadow slot, growing refs on
-// demand.
-//
-// Slots are numbered downward from execCtx.shadowRefsTop, which the prologue
-// has already raised by the frame's slot count. A frame therefore occupies
-// exactly the range it reserved, and its callees start above it. Numbering
-// upward instead would place a frame's slots in the region its callee is
-// about to reserve, where a callee with fewer slots overwrites its caller's
-// roots.
-//
-//	refsTop after g's prologue ->  +-------+
-//	                               |  g    |  g's slots
-//	refsTop after f's prologue ->  +-------+
-//	                               |  f    |  f's slots
-//	           refsTop on entry -> +-------+
-func (c *callEngine) setShadowRef(slot int, p unsafe.Pointer) {
-	i := int(c.execCtx.shadowRefsTop) - 1 - slot
-	if i >= len(c.refs) {
-		c.refs = append(c.refs, make([]unsafe.Pointer, i+1-len(c.refs))...)
-	}
-	c.refs[i] = p
-}
-
-// resetShadowRefs drops the roots of a finished call so its exceptions are
-// collectable, and rewinds the shadow stack for the next one.
-func (c *callEngine) resetShadowRefs() {
-	clear(c.refs)
-	c.execCtx.shadowRefsTop = 0
-}
-
 func (c *callEngine) restoreLocalsSaveAreaPtr(from int) {
 	for i := from; i >= 0; i-- {
 		if sa := c.tryHandlers[i].localsSaveArea; len(sa) > 0 {
@@ -825,6 +876,126 @@ func (c *callEngine) restoreLocalsSaveAreaPtr(from int) {
 		}
 	}
 	c.execCtx.localsSaveAreaPtr = 0
+}
+
+// storeExnrefSlot is the write barrier for an exnref-typed global or table slot. We resolve
+// the handle to a Go pointer to store into the exception store
+func (c *callEngine) storeExnrefSlot(slot *wasm.Reference, handle wasm.Reference) {
+	exn, ok := c.heldExceptions[handle]
+	if !ok && handle != 0 {
+		panic(wasmruntime.ErrRuntimeExpiredExceptionRef)
+	}
+	c.parent.parent.parent.exceptions.StoreSlot(slot, exn)
+}
+
+// loadExnrefSlot is the read barrier for an exnref-typed global or table slot. We add
+// the handle to the local table so the exnref can be resolved where needed.
+func (c *callEngine) loadExnrefSlot(slot *wasm.Reference) wasm.Reference {
+	exn := c.parent.parent.parent.exceptions.LoadSlot(slot)
+	if exn == nil {
+		return 0
+	}
+	c.holdException(exn)
+	return exn.ID
+}
+
+func (c *callEngine) holdException(exn *wasm.Exception) {
+	if c.heldExceptions == nil {
+		c.heldExceptions = make(map[wasm.Reference]*wasm.Exception)
+	}
+	c.heldExceptions[exn.ID] = exn
+}
+
+// collectGarbage drops from heldExceptions every exception this call can no longer reach.
+func (c *callEngine) collectGarbage() {
+	held := c.heldExceptions
+	if len(held) == 0 {
+		return
+	}
+	kept := c.collectedExceptions
+	if kept == nil {
+		kept = make(map[wasm.Reference]*wasm.Exception, len(held))
+	}
+
+	keepIfHeld := func(w uint64) {
+		if wasm.MayBeExceptionHandle(w) {
+			if exn := held[wasm.Reference(w)]; exn != nil {
+				kept[wasm.Reference(w)] = exn
+			}
+		}
+	}
+
+	stackScan(c.stack, uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall)), c.stackTop, keepIfHeld)
+	registerScan(&c.execCtx.savedRegisters, keepIfHeld)
+	for i := range c.tryHandlers {
+		h := &c.tryHandlers[i]
+		for _, w := range h.localsSaveArea {
+			keepIfHeld(w)
+		}
+		stackScan(h.stack, h.sp, h.top, keepIfHeld)
+		registerScan(&h.savedRegisters, keepIfHeld)
+	}
+
+	c.heldExceptions, c.collectedExceptions = kept, held
+	clear(held)
+}
+
+// stackScan scans the live part of a stack, [sp, top).
+func stackScan(stack []byte, sp, top uintptr, handleContent func(uint64)) {
+	base := uintptr(unsafe.Pointer(&stack[0]))
+	live := stack[sp-base : top-base]
+	// Every 4 bytes rather than every 8: spill slots are sized to their value's type, so an
+	// i64 spilled after an i32 starts 4 bytes into a word.
+	for i := int((4 - sp&3) & 3); i+8 <= len(live); i += 4 {
+		handleContent(binary.LittleEndian.Uint64(live[i:]))
+	}
+}
+
+// registerScan scans a register file.
+func registerScan(regs *[64][2]uint64, handleContent func(uint64)) {
+	for _, r := range regs {
+		handleContent(r[0])
+		handleContent(r[1])
+	}
+}
+
+// notifyAbortListenerOf notifies the listener of the function containing addr, if it has one,
+// that an exception is unwinding its frame. Compiled code calls the after-listener on the
+// return paths, which a frame an exception takes out never reaches.
+func (c *callEngine) notifyAbortListenerOf(ctx context.Context, addr uintptr) {
+	me := c.moduleEngineOfAddr(addr)
+	if me == nil {
+		return
+	}
+	cm := me.parent
+	if len(cm.listeners) == 0 {
+		return
+	}
+	index := cm.functionIndexOf(addr)
+	if lsn := cm.listeners[index]; lsn != nil {
+		def := cm.module.FunctionDefinition(cm.module.ImportFunctionCount + index)
+		lsn.Abort(ctx, me.module, def, experimental.ErrUnwoundByException)
+	}
+}
+
+// moduleEngineOfAddr is the module engine whose executable holds addr, which says both what
+// function the frame is in and which instance it belongs to -- a listener is told the module
+// the function it is watching is in, not the one the exception came from.
+//
+// The search is over the instances this call can reach: the one it is running in, and the
+// ones it imports from, which between them cover the frames a call can have. Unwinding runs
+// this per frame, so it is a couple of range checks rather than a search over everything the
+// engine holds.
+func (c *callEngine) moduleEngineOfAddr(addr uintptr) *moduleEngine {
+	if checkAddrInBytes(addr, c.parent.parent.executable) {
+		return c.parent
+	}
+	for i := range c.parent.importedFunctions {
+		if me := c.parent.importedFunctions[i].me; checkAddrInBytes(addr, me.parent.executable) {
+			return me
+		}
+	}
+	return nil
 }
 
 func (c *callEngine) callerModuleInstance() *wasm.ModuleInstance {
@@ -911,7 +1082,7 @@ func (si *stackIterator) reset(c *callEngine, onHostCall bool) {
 	} else {
 		si.retAddrs = si.retAddrs[:0]
 	}
-	si.retAddrs = unwindStack(uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall)), c.execCtx.framePointerBeforeGoCall, c.stackTop, si.retAddrs)
+	si.retAddrs = unwindStack(uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall)), c.execCtx.framePointerBeforeGoCall, c.stackTop, si.retAddrs, wasmdebug.MaxFrames)
 	si.retAddrs = si.retAddrs[:len(si.retAddrs)-1] // the last return addr is the trampoline, so we skip it.
 	si.retAddrCursor = 0
 	si.eng = c.parent.parent.parent
@@ -966,6 +1137,7 @@ type snapshot struct {
 	savedRegisters [64][2]uint64
 	ret            []uint64
 	c              *callEngine
+	heldExceptions map[wasm.Reference]*wasm.Exception
 }
 
 // Snapshot implements the same method as documented on experimental.Snapshotter.
@@ -982,6 +1154,7 @@ func (c *callEngine) Snapshot() experimental.Snapshot {
 		returnAddress:  returnAddress,
 		stack:          newStack,
 		c:              c,
+		heldExceptions: maps.Clone(c.heldExceptions),
 	}
 }
 
@@ -1005,6 +1178,9 @@ func (s *snapshot) doRestore() {
 	ec.framePointerBeforeGoCall = s.fp
 	ec.goCallReturnAddress = s.returnAddress
 	ec.savedRegisters = s.savedRegisters
+	for _, exn := range s.heldExceptions {
+		c.holdException(exn)
+	}
 }
 
 // Error implements the same method on error.

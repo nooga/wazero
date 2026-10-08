@@ -38,6 +38,7 @@ type engine struct {
 	enabledFeatures   api.CoreFeatures
 	compiledFunctions map[wasm.ModuleID]*compiledFunctionWithCount // guarded by mutex.
 	mux               sync.Mutex
+	exceptions        wasm.ExceptionStore // exceptions outliving the call that threw them.
 }
 
 func NewEngine(_ context.Context, enabledFeatures api.CoreFeatures, _ filecache.Cache) wasm.Engine {
@@ -112,6 +113,10 @@ type moduleEngine struct {
 
 	// parentEngine holds *engine from which this module engine is created from.
 	parentEngine *engine
+
+	// instance is the module instance this engine was created for, used on close to drop
+	// the exnrefs its globals and tables still hold.
+	instance *wasm.ModuleInstance
 }
 
 // GetGlobalValue implements the same method as documented on wasm.ModuleEngine.
@@ -153,13 +158,13 @@ type thrownException struct {
 func (t *thrownException) canRestore(ce *callEngine, callerFrameCount int) bool {
 	ce.frames = ce.frames[:callerFrameCount]
 	frame := ce.frames[callerFrameCount-1]
-	t.clause, t.values = searchExceptionTable(t.exception, frame)
+	t.clause, t.values = ce.searchExceptionTable(t.exception, frame)
 	return t.clause != nil
 }
 
 func (t *thrownException) doRestore(ce *callEngine, callerFrameCount int) {
 	frame := ce.frames[callerFrameCount-1]
-	ce.applyExceptionHandler(frame, t.clause, t.values, t.exception)
+	ce.applyExceptionHandler(frame, t.clause, t.values)
 	t.clause, t.values = nil, nil
 }
 
@@ -174,24 +179,6 @@ type callEngine struct {
 	// Note that all the values are represented as uint64.
 	stack []uint64
 
-	// refs is the shadow stack: refs[i] holds the Go pointer behind the
-	// reference wasm keeps in stack[i] as an opaque uint64, so Go's GC
-	// keeps the object alive (the uint64 is invisible to it).
-	//
-	//	stack ([]uint64)     refs ([]unsafe.Pointer)
-	//	┌──────────────┐     ┌──────────────┐
-	//	│ 42           │ i+1 │ nil          │
-	//	│ ptr(E)       │ i   │ E ───────────┼──► *wasm.Exception
-	//	└──────────────┘     └──────────────┘
-	//
-	// Only ref-producing and ref-moving ops maintain it; numeric ops leave
-	// stale entries behind. That is harmless (retention bounded to one
-	// object per slot) because nothing ever reads refs for semantics: Go's
-	// GC is non-moving, so the uint64 copy stays valid while any shadow
-	// slot, global or table entry holds the pointer. Cleared when the
-	// top-level call returns. Grows lazily: nil for modules without refs.
-	refs []unsafe.Pointer
-
 	// frames are the function call stack.
 	frames []*callFrame
 
@@ -200,26 +187,37 @@ type callEngine struct {
 
 	// stackiterator for Listeners to walk frames and stack.
 	stackIterator stackIterator
+
+	// engine is the engine this call engine was created from.
+	engine *engine
+
+	// heldExceptions contains the exceptions referenced within this call, keyed by exnref
+	// handle.
+	heldExceptions map[wasm.Reference]*wasm.Exception
 }
 
 // matchCatchClause checks whether a single catch clause matches the given exception.
 // Returns whether it matched and the values to push onto the stack.
-func matchCatchClause(kind byte, clauseTag *wasm.TagInstance, exn *wasm.Exception) (matched bool, values []uint64) {
+func (ce *callEngine) matchCatchClause(kind byte, clauseTag *wasm.TagInstance, exn *wasm.Exception) (matched bool, values []uint64) {
 	switch kind {
 	case wasm.CatchKindCatch:
 		if exn.Tag == clauseTag {
+			ce.holdParamRefs(exn)
 			return true, slices.Clone(exn.Params)
 		}
 	case wasm.CatchKindCatchRef:
 		if exn.Tag == clauseTag {
+			ce.holdParamRefs(exn)
+			ce.holdException(exn)
 			values = slices.Clone(exn.Params)
-			values = append(values, uint64(uintptr(unsafe.Pointer(exn))))
+			values = append(values, uint64(exn.ID))
 			return true, values
 		}
 	case wasm.CatchKindCatchAll:
 		return true, nil
 	case wasm.CatchKindCatchAllRef:
-		return true, []uint64{uint64(uintptr(unsafe.Pointer(exn)))}
+		ce.holdException(exn)
+		return true, []uint64{uint64(exn.ID)}
 	}
 	return false, nil
 }
@@ -228,8 +226,7 @@ func matchCatchClause(kind byte, clauseTag *wasm.TagInstance, exn *wasm.Exceptio
 // for a handler matching the given exception at the current PC. Returns the
 // matched clause and catch values, or nil if no handler matches. Searches
 // backwards so inner try_tables (which have higher indices) are checked first.
-// This function is pure — it does not modify callEngine state.
-func searchExceptionTable(exn *wasm.Exception, frame *callFrame) (*exceptionTableCatchClause, []uint64) {
+func (ce *callEngine) searchExceptionTable(exn *wasm.Exception, frame *callFrame) (*exceptionTableCatchClause, []uint64) {
 	table := frame.f.parent.exceptionTable
 	pc := frame.pc
 	for i := len(table) - 1; i >= 0; i-- {
@@ -243,7 +240,7 @@ func searchExceptionTable(exn *wasm.Exception, frame *callFrame) (*exceptionTabl
 			if clause.kind == wasm.CatchKindCatch || clause.kind == wasm.CatchKindCatchRef {
 				clauseTag = frame.f.moduleInstance.Tags[clause.tagIndex]
 			}
-			matched, values := matchCatchClause(clause.kind, clauseTag, exn)
+			matched, values := ce.matchCatchClause(clause.kind, clauseTag, exn)
 			if matched {
 				return clause, values
 			}
@@ -253,26 +250,10 @@ func searchExceptionTable(exn *wasm.Exception, frame *callFrame) (*exceptionTabl
 }
 
 // applyExceptionHandler applies a matched exception table clause to the callEngine state.
-func (ce *callEngine) applyExceptionHandler(frame *callFrame, clause *exceptionTableCatchClause, values []uint64, exn *wasm.Exception) {
+func (ce *callEngine) applyExceptionHandler(frame *callFrame, clause *exceptionTableCatchClause, values []uint64) {
 	ce.stack = ce.stack[:frame.base-frame.f.funcType.ParamNumInUint64+clause.targetStackDepth]
-	base := len(ce.stack)
 	ce.stack = append(ce.stack, values...)
 	frame.pc = clause.targetPC
-
-	// Root the catch values: params carry the exception's own refs, and the
-	// exnref pushed by catch_ref / catch_all_ref carries the exception.
-	// Slots reused for the values may hold stale entries; clear them first.
-	for i := base; i < len(ce.stack) && i < len(ce.refs); i++ {
-		ce.refs[i] = nil
-	}
-	if clause.kind == wasm.CatchKindCatch || clause.kind == wasm.CatchKindCatchRef {
-		for i, p := range exn.Refs {
-			ce.setRef(base+i, p)
-		}
-	}
-	if clause.kind == wasm.CatchKindCatchRef || clause.kind == wasm.CatchKindCatchAllRef {
-		ce.setRef(base+len(values)-1, unsafe.Pointer(exn))
-	}
 }
 
 // callWithUnwind calls the target function with support for stack unwinding
@@ -306,8 +287,62 @@ func (ce *callEngine) callWithUnwind(ctx context.Context, m *wasm.ModuleInstance
 	return caught
 }
 
+// holdException makes exn resolvable by its handle for the rest of the call.
+func (ce *callEngine) holdException(exn *wasm.Exception) {
+	if ce.heldExceptions == nil {
+		ce.heldExceptions = make(map[wasm.Reference]*wasm.Exception)
+	}
+	ce.heldExceptions[exn.ID] = exn
+}
+
+// holdParamRefs holds the exceptions named by exn's exnref params, which a tag-matched
+// clause is about to push for the handler.
+func (ce *callEngine) holdParamRefs(exn *wasm.Exception) {
+	for _, p := range exn.ParamRefs {
+		ce.holdException(p)
+	}
+}
+
+// resolveExnrefParamRefs resolves the exceptions a raise's exnref params name. Only the raising call
+// can: it is the one holding them, having had them on its operand stack. Ones it cannot reach
+// are left out -- nothing can, so there is nothing to keep alive.
+func (ce *callEngine) resolveExnrefParamRefs(tag *wasm.TagInstance, params []uint64) []*wasm.Exception {
+	var refs []*wasm.Exception
+	for i, t := range tag.Type.Params {
+		if wasm.IsExnref(t) {
+			if p := ce.heldExceptions[wasm.Reference(params[i])]; p != nil {
+				refs = append(refs, p)
+			}
+		}
+	}
+	return refs
+}
+
+// storeExnrefSlot is the write barrier for an exnref-typed global or table slot. The
+// handle comes from guest code, so this call must hold what it names.
+func (ce *callEngine) storeExnrefSlot(slot *wasm.Reference, handle wasm.Reference) {
+	var exn *wasm.Exception
+	if handle != 0 {
+		if exn = ce.heldExceptions[handle]; exn == nil {
+			panic(wasmruntime.ErrRuntimeExpiredExceptionRef)
+		}
+	}
+	ce.engine.exceptions.StoreSlot(slot, exn)
+}
+
+// loadExnrefSlot is the read barrier: what a slot names becomes reachable from this call,
+// so it stays resolvable even if the slot is overwritten before the call ends.
+func (ce *callEngine) loadExnrefSlot(slot *wasm.Reference) wasm.Reference {
+	exn := ce.engine.exceptions.LoadSlot(slot)
+	if exn == nil {
+		return 0
+	}
+	ce.holdException(exn)
+	return exn.ID
+}
+
 func (e *moduleEngine) newCallEngine(compiled *function) *callEngine {
-	return &callEngine{f: compiled}
+	return &callEngine{f: compiled, engine: e.parentEngine}
 }
 
 func (ce *callEngine) pushValue(v uint64) {
@@ -357,65 +392,6 @@ func (ce *callEngine) drop(raw uint64) {
 		newStack = append(newStack, ce.stack[int32(len(ce.stack))-r.Start:]...)
 		ce.stack = newStack
 	}
-}
-
-// dropRef is drop for functions where the kept values may be references:
-// their shadow entries move with them.
-func (ce *callEngine) dropRef(raw uint64) {
-	r := inclusiveRangeFromU64(raw)
-	if r.Start > 0 {
-		n := len(ce.stack)
-		ce.moveRefs(n-1-int(r.End), n-int(r.Start), int(r.Start))
-	}
-	ce.drop(raw)
-}
-
-// refAt returns the shadow entry for stack[i], nil if never written.
-func (ce *callEngine) refAt(i int) unsafe.Pointer {
-	if i >= len(ce.refs) {
-		return nil
-	}
-	return ce.refs[i]
-}
-
-// setRef writes the shadow entry for stack[i], growing refs on demand.
-func (ce *callEngine) setRef(i int, p unsafe.Pointer) {
-	if i >= len(ce.refs) {
-		if p == nil {
-			return
-		}
-		ce.refs = append(ce.refs, make([]unsafe.Pointer, i+1-len(ce.refs))...)
-	}
-	ce.refs[i] = p
-}
-
-// pushRef pushes v and records p as the Go pointer behind it.
-func (ce *callEngine) pushRef(v uint64, p unsafe.Pointer) {
-	ce.setRef(len(ce.stack), p)
-	ce.pushValue(v)
-}
-
-// popRef pops v together with the Go pointer recorded behind it. The slot
-// is cleared so a later plain push there does not adopt a stale pointer.
-func (ce *callEngine) popRef() (uint64, unsafe.Pointer) {
-	var p unsafe.Pointer
-	if i := len(ce.stack) - 1; i < len(ce.refs) {
-		p = ce.refs[i]
-		ce.refs[i] = nil
-	}
-	return ce.popValue(), p
-}
-
-// moveRefs mirrors copy(stack[dst:dst+n], stack[src:src+n]) on the shadow
-// stack. Entries past the end of refs were never written and stay nil.
-func (ce *callEngine) moveRefs(dst, src, n int) {
-	if avail := len(ce.refs) - src; avail < n {
-		n = avail
-	}
-	if n <= 0 {
-		return
-	}
-	copy(ce.refs[dst:dst+n], ce.refs[src:src+n])
 }
 
 func (ce *callEngine) pushFrame(frame *callFrame) {
@@ -476,7 +452,6 @@ func functionFromUintptr(ptr uintptr) *function {
 
 type snapshot struct {
 	stack  []uint64
-	refs   []unsafe.Pointer
 	frames []*callFrame
 	pc     uint64
 
@@ -489,7 +464,6 @@ type snapshot struct {
 func (ce *callEngine) Snapshot() experimental.Snapshot {
 	return &snapshot{
 		stack:  slices.Clone(ce.stack),
-		refs:   slices.Clone(ce.refs),
 		frames: slices.Clone(ce.frames),
 		ce:     ce,
 	}
@@ -509,7 +483,6 @@ func (s *snapshot) doRestore(_ *callEngine, _ int) {
 	ce := s.ce
 
 	ce.stack = s.stack
-	ce.refs = s.refs
 	ce.frames = s.frames
 	ce.frames[len(ce.frames)-1].pc = s.pc
 
@@ -647,6 +620,7 @@ func (e *engine) CompileModule(_ context.Context, module *wasm.Module, listeners
 func (e *engine) NewModuleEngine(module *wasm.Module, instance *wasm.ModuleInstance) (wasm.ModuleEngine, error) {
 	me := &moduleEngine{
 		parentEngine: e,
+		instance:     instance,
 		functions:    make([]function, len(module.FunctionSection)+int(module.ImportFunctionCount)),
 	}
 
@@ -705,10 +679,10 @@ func (e *engine) lowerIR(ir *compilationResult, ret *compiledFunction) error {
 		switch op.Kind {
 		case operationKindBr:
 			e.setLabelAddress(&op.U1, label(op.U1), labelAddressResolutions)
-		case operationKindBrIf, operationKindBrIfRef:
+		case operationKindBrIf:
 			e.setLabelAddress(&op.U1, label(op.U1), labelAddressResolutions)
 			e.setLabelAddress(&op.U2, label(op.U2), labelAddressResolutions)
-		case operationKindBrTable, operationKindBrTableRef:
+		case operationKindBrTable:
 			for j := 0; j < len(op.Us); j += 2 {
 				target := op.Us[j]
 				e.setLabelAddress(&op.Us[j], label(target), labelAddressResolutions)
@@ -777,6 +751,11 @@ func (e *moduleEngine) ResolveImportedMemory(wasm.ModuleEngine) {}
 
 // DoneInstantiation implements wasm.ModuleEngine.
 func (e *moduleEngine) DoneInstantiation() {}
+
+// ModuleClosed implements wasm.ModuleEngine.
+func (e *moduleEngine) ModuleClosed() {
+	e.parentEngine.exceptions.ReleaseModuleSlots(e.instance)
+}
 
 // FunctionInstanceReference implements the same method as documented on wasm.ModuleEngine.
 func (e *moduleEngine) FunctionInstanceReference(funcIndex wasm.Index) wasm.Reference {
@@ -864,6 +843,9 @@ func (ce *callEngine) call(ctx context.Context, params, results []uint64) (_ []u
 		if v := recover(); v != nil {
 			err = ce.recoverOnCall(ctx, m, v)
 		}
+
+		// Drop this call's pins. What a global or table holds stays alive in the store.
+		clear(ce.heldExceptions)
 	}()
 
 	ce.pushValues(params)
@@ -933,14 +915,15 @@ func (ce *callEngine) recoverOnCall(ctx context.Context, m *wasm.ModuleInstance,
 	}
 
 	err = builder.FromRecovered(v)
-	for i := range functionListeners {
-		functionListeners[i].Abort(ctx, m, functionListeners[i].def, err)
+
+	if !errors.Is(err, wasmruntime.ErrRuntimeUncaughtException) { // Don't call listeners on an uncaught exception: they will have already been notified as the stack unwound
+		for i := range functionListeners {
+			functionListeners[i].Abort(ctx, m, functionListeners[i].def, err)
+		}
 	}
 
-	// Allows the reuse of CallEngine. Shadow entries are stale from here
-	// on; drop them so finished calls do not pin objects.
+	// Allows the reuse of CallEngine.
 	ce.stack, ce.frames = ce.stack[:0], ce.frames[:0]
-	clear(ce.refs)
 	return
 }
 
@@ -1017,13 +1000,6 @@ func (ce *callEngine) callNativeFunc(ctx context.Context, m *wasm.ModuleInstance
 			} else {
 				frame.pc = op.U2
 			}
-		case operationKindBrIfRef:
-			if ce.popValue() > 0 {
-				ce.dropRef(op.U3)
-				frame.pc = op.U1
-			} else {
-				frame.pc = op.U2
-			}
 		case operationKindBrTable:
 			v := ce.popValue()
 			defaultAt := uint64(len(op.Us))/2 - 1
@@ -1032,15 +1008,6 @@ func (ce *callEngine) callNativeFunc(ctx context.Context, m *wasm.ModuleInstance
 			}
 			v *= 2
 			ce.drop(op.Us[v+1])
-			frame.pc = op.Us[v]
-		case operationKindBrTableRef:
-			v := ce.popValue()
-			defaultAt := uint64(len(op.Us))/2 - 1
-			if v > defaultAt {
-				v = defaultAt
-			}
-			v *= 2
-			ce.dropRef(op.Us[v+1])
 			frame.pc = op.Us[v]
 		case operationKindCall:
 			frameUnwound := ce.callWithUnwind(ctx, f.moduleInstance, &functions[op.U1])
@@ -1067,9 +1034,6 @@ func (ce *callEngine) callNativeFunc(ctx context.Context, m *wasm.ModuleInstance
 		case operationKindDrop:
 			ce.drop(op.U1)
 			frame.pc++
-		case operationKindDropRef:
-			ce.dropRef(op.U1)
-			frame.pc++
 		case operationKindSelect:
 			c := ce.popValue()
 			if op.B3 { // Target is vector.
@@ -1087,24 +1051,12 @@ func (ce *callEngine) callNativeFunc(ctx context.Context, m *wasm.ModuleInstance
 				}
 			}
 			frame.pc++
-		case operationKindSelectRef:
-			c := ce.popValue()
-			v2, p2 := ce.popRef()
-			if c == 0 {
-				_ = ce.popValue()
-				ce.pushRef(v2, p2)
-			}
-			frame.pc++
 		case operationKindPick:
 			index := len(ce.stack) - 1 - int(op.U1)
 			ce.pushValue(ce.stack[index])
 			if op.B3 { // V128 value target.
 				ce.pushValue(ce.stack[index+1])
 			}
-			frame.pc++
-		case operationKindPickRef:
-			index := len(ce.stack) - 1 - int(op.U1)
-			ce.pushRef(ce.stack[index], ce.refAt(index))
 			frame.pc++
 		case operationKindSet:
 			if op.B3 { // V128 value target.
@@ -1117,15 +1069,14 @@ func (ce *callEngine) callNativeFunc(ctx context.Context, m *wasm.ModuleInstance
 				ce.stack[index] = ce.popValue()
 			}
 			frame.pc++
-		case operationKindSetRef:
-			index := len(ce.stack) - 1 - int(op.U1)
-			v, p := ce.popRef()
-			ce.stack[index] = v
-			ce.setRef(index, p)
-			frame.pc++
 		case operationKindGlobalGet:
 			g := globals[op.U1]
-			ce.pushRef(g.Val, moduleInst.GlobalRef(wasm.Index(op.U1)))
+			if wasm.IsExnref(g.Type.ValType) {
+				ce.pushValue(uint64(ce.loadExnrefSlot(wasm.ExnrefSlot(g))))
+				frame.pc++
+				continue
+			}
+			ce.pushValue(g.Val)
 			if g.Type.ValType == wasm.ValueTypeV128 {
 				ce.pushValue(g.ValHi)
 			}
@@ -1135,9 +1086,12 @@ func (ce *callEngine) callNativeFunc(ctx context.Context, m *wasm.ModuleInstance
 			if g.Type.ValType == wasm.ValueTypeV128 {
 				g.ValHi = ce.popValue()
 			}
-			var p unsafe.Pointer
-			g.Val, p = ce.popRef()
-			moduleInst.SetGlobalRef(wasm.Index(op.U1), p)
+			v := ce.popValue()
+			if wasm.IsExnref(g.Type.ValType) {
+				ce.storeExnrefSlot(wasm.ExnrefSlot(g), wasm.Reference(v))
+			} else {
+				g.Val = v
+			}
 			frame.pc++
 		case operationKindLoad:
 			offset := ce.popMemoryOffset(op)
@@ -2086,6 +2040,14 @@ func (ce *callEngine) callNativeFunc(ctx context.Context, m *wasm.ModuleInstance
 				inTableOffset+copySize > uint64(len(table.References)) {
 				panic(wasmruntime.ErrRuntimeInvalidTableAccess)
 			} else if copySize != 0 {
+				if wasm.IsExnref(table.Type) {
+					for i := uint64(0); i < copySize; i++ {
+						ce.engine.exceptions.CopySlot(&table.References[inTableOffset+i],
+							&elementInstance[inElementOffset+i])
+					}
+					frame.pc++
+					continue
+				}
 				copy(table.References[inTableOffset:inTableOffset+copySize], elementInstance[inElementOffset:])
 			}
 			frame.pc++
@@ -2093,16 +2055,24 @@ func (ce *callEngine) callNativeFunc(ctx context.Context, m *wasm.ModuleInstance
 			elementInstances[op.U1] = nil
 			frame.pc++
 		case operationKindTableCopy:
-			src, dst := tables[op.U1], tables[op.U2]
-			srcTable, dstTable := src.References, dst.References
+			srcTable, dstTable := tables[op.U1].References, tables[op.U2].References
 			copySize := ce.popValue()
 			sourceOffset := ce.popValue()
 			destinationOffset := ce.popValue()
 			if sourceOffset+copySize > uint64(len(srcTable)) || destinationOffset+copySize > uint64(len(dstTable)) {
 				panic(wasmruntime.ErrRuntimeInvalidTableAccess)
 			} else if copySize != 0 {
+				if wasm.IsExnref(tables[op.U2].Type) {
+					// Snapshot the source: the regions may overlap, and each write releases
+					// what the destination slot held.
+					src := slices.Clone(srcTable[sourceOffset : sourceOffset+copySize])
+					for i := range src {
+						ce.engine.exceptions.CopySlot(&dstTable[destinationOffset+uint64(i)], &src[i])
+					}
+					frame.pc++
+					continue
+				}
 				copy(dstTable[destinationOffset:], srcTable[sourceOffset:sourceOffset+copySize])
-				dst.CopyRefs(uint32(destinationOffset), src, uint32(sourceOffset), uint32(copySize))
 			}
 			frame.pc++
 		case operationKindRefFunc:
@@ -2116,19 +2086,28 @@ func (ce *callEngine) callNativeFunc(ctx context.Context, m *wasm.ModuleInstance
 				panic(wasmruntime.ErrRuntimeInvalidTableAccess)
 			}
 
-			ce.pushRef(uint64(table.References[offset]), table.RefAt(uint32(offset)))
+			if wasm.IsExnref(table.Type) {
+				ce.pushValue(uint64(ce.loadExnrefSlot(&table.References[offset])))
+				frame.pc++
+				continue
+			}
+			ce.pushValue(uint64(table.References[offset]))
 			frame.pc++
 		case operationKindTableSet:
 			table := tables[op.U1]
-			ref, p := ce.popRef()
+			ref := ce.popValue()
 
 			offset := ce.popValue()
 			if offset >= uint64(len(table.References)) {
 				panic(wasmruntime.ErrRuntimeInvalidTableAccess)
 			}
 
+			if wasm.IsExnref(table.Type) {
+				ce.storeExnrefSlot(&table.References[offset], wasm.Reference(ref))
+				frame.pc++
+				continue
+			}
 			table.References[offset] = uintptr(ref) // externrefs are opaque uint64.
-			table.SetRef(uint32(offset), p)
 			frame.pc++
 		case operationKindTableSize:
 			table := tables[op.U1]
@@ -2136,25 +2115,33 @@ func (ce *callEngine) callNativeFunc(ctx context.Context, m *wasm.ModuleInstance
 			frame.pc++
 		case operationKindTableGrow:
 			table := tables[op.U1]
-			num := ce.popValue()
-			ref, p := ce.popRef()
-			currentLen := table.Grow(uint32(num), uintptr(ref))
-			if currentLen != 0xffffffff {
-				table.FillRefs(currentLen, uint32(num), p)
+			num, ref := ce.popValue(), ce.popValue()
+			before := uint64(len(table.References))
+			ret := table.Grow(uint32(num), uintptr(ref))
+			if wasm.IsExnref(table.Type) && ref != 0 && uint64(len(table.References)) > before {
+				// Grow wrote the slots already; record one more naming apiece.
+				exn := ce.heldExceptions[wasm.Reference(ref)]
+				if exn == nil {
+					panic(wasmruntime.ErrRuntimeExpiredExceptionRef)
+				}
+				for i := before; i < uint64(len(table.References)); i++ {
+					ce.engine.exceptions.Retain(exn)
+				}
 			}
-			ret := currentLen
 			ce.pushValue(uint64(ret))
 			frame.pc++
 		case operationKindTableFill:
 			table := tables[op.U1]
 			num := ce.popValue()
-			refV, p := ce.popRef()
-			ref := uintptr(refV)
+			ref := uintptr(ce.popValue())
 			offset := ce.popValue()
 			if num+offset > uint64(len(table.References)) {
 				panic(wasmruntime.ErrRuntimeInvalidTableAccess)
+			} else if wasm.IsExnref(table.Type) {
+				for i := offset; i < offset+num; i++ {
+					ce.storeExnrefSlot(&table.References[i], ref)
+				}
 			} else if num > 0 {
-				table.FillRefs(uint32(offset), uint32(num), p)
 				// Uses the copy trick for faster filling the region with the value.
 				// https://github.com/golang/go/blob/go1.24.0/src/slices/slices.go#L514-L517
 				targetRegion := table.References[offset : offset+num]
@@ -4688,21 +4675,14 @@ func (ce *callEngine) callNativeFunc(ctx context.Context, m *wasm.ModuleInstance
 			tag := moduleInst.Tags[tagIndex]
 			paramCount := len(tag.Type.Params)
 			params := make([]uint64, paramCount)
-			var refs []unsafe.Pointer
 			for i := paramCount - 1; i >= 0; i-- {
-				var p unsafe.Pointer
-				params[i], p = ce.popRef()
-				if p == nil {
-					continue
-				}
-				if refs == nil {
-					refs = make([]unsafe.Pointer, paramCount)
-				}
-				refs[i] = p
+				params[i] = ce.popValue()
 			}
-			exn := &wasm.Exception{Tag: tag, Params: params, Refs: refs}
-			if clause, values := searchExceptionTable(exn, frame); clause != nil {
-				ce.applyExceptionHandler(frame, clause, values, exn)
+			exn := ce.engine.exceptions.NewException(tag, params, ce.resolveExnrefParamRefs(tag, params))
+			// Don't record this as a held exception yet: the exnref hasn't been exposed to wasm code
+			// yet, until we do a catch.
+			if clause, values := ce.searchExceptionTable(exn, frame); clause != nil {
+				ce.applyExceptionHandler(frame, clause, values)
 				continue
 			}
 			panic(&thrownException{exception: exn})
@@ -4712,11 +4692,14 @@ func (ce *callEngine) callNativeFunc(ctx context.Context, m *wasm.ModuleInstance
 			if v == 0 {
 				panic(wasmruntime.ErrRuntimeNullReference) // throw_ref on null exnref traps
 			}
-			// Read the Exception pointer directly from the uint64 value to avoid
-			// conversion from uintptr into unsafe.Pointer, which triggers checkptr.
-			exn := *(**wasm.Exception)(unsafe.Pointer(&v))
-			if clause, values := searchExceptionTable(exn, frame); clause != nil {
-				ce.applyExceptionHandler(frame, clause, values, exn)
+			exn := ce.heldExceptions[wasm.Reference(v)]
+			if exn == nil {
+				// One this call cannot reach, such as a handle host code kept from an
+				// earlier call.
+				panic(wasmruntime.ErrRuntimeExpiredExceptionRef)
+			}
+			if clause, values := ce.searchExceptionTable(exn, frame); clause != nil {
+				ce.applyExceptionHandler(frame, clause, values)
 				continue
 			}
 			panic(&thrownException{exception: exn})
@@ -4744,7 +4727,7 @@ func (ce *callEngine) callNativeFunc(ctx context.Context, m *wasm.ModuleInstance
 					continue
 				}
 				// Return
-				ce.dropRef(op.Us[0])
+				ce.drop(op.Us[0])
 				// Jump to the function frame (return)
 				frame.pc = op.Us[1]
 				continue
@@ -4784,7 +4767,7 @@ func (ce *callEngine) callNativeFunc(ctx context.Context, m *wasm.ModuleInstance
 					bodyLen = uint64(len(body))
 					continue
 				}
-				ce.dropRef(op.Us[0])
+				ce.drop(op.Us[0])
 				frame.pc = op.Us[1]
 				continue
 			}
@@ -4801,20 +4784,20 @@ func (ce *callEngine) callNativeFunc(ctx context.Context, m *wasm.ModuleInstance
 			frame.pc++
 
 		case operationKindBrOnNull:
-			ref, p := ce.popRef()
+			ref := ce.popValue()
 			if ref == 0 {
-				ce.dropRef(op.U3)
+				ce.drop(op.U3)
 				frame.pc = op.U1
 			} else {
-				ce.pushRef(ref, p)
+				ce.pushValue(ref)
 				frame.pc = op.U2
 			}
 
 		case operationKindBrOnNonNull:
-			ref, p := ce.popRef()
+			ref := ce.popValue()
 			if ref != 0 {
-				ce.dropRef(op.U3)
-				ce.pushRef(ref, p)
+				ce.drop(op.U3)
+				ce.pushValue(ref)
 				frame.pc = op.U1
 			} else {
 				frame.pc = op.U2
@@ -4830,7 +4813,6 @@ func (ce *callEngine) callNativeFunc(ctx context.Context, m *wasm.ModuleInstance
 func (ce *callEngine) dropForTailCall(frame *callFrame, f *function) {
 	base := frame.base - frame.f.funcType.ParamNumInUint64
 	paramCount := f.funcType.ParamNumInUint64
-	ce.moveRefs(base, len(ce.stack)-paramCount, paramCount)
 	ce.stack = append(ce.stack[:base], ce.stack[len(ce.stack)-paramCount:]...)
 }
 
@@ -5064,6 +5046,17 @@ func (ce *callEngine) callNativeFuncWithListener(ctx context.Context, m *wasm.Mo
 	ce.stackIterator.reset(ce.stack, ce.frames, f)
 	fnl.Before(ctx, m, def, ce.peekValues(typ.ParamNumInUint64), &ce.stackIterator)
 	ce.stackIterator.clear()
+	// A frame an exception unwinds leaves without returning, which is what Abort reports.
+	// It fires here rather than where the exception comes to rest, since the frame is gone
+	// either way. Other panics unwind the whole call, which recoverOnCall reports.
+	defer func() {
+		if r := recover(); r != nil {
+			if _, ok := r.(*thrownException); ok {
+				fnl.Abort(ctx, m, def, experimental.ErrUnwoundByException)
+			}
+			panic(r)
+		}
+	}()
 	ce.callNativeFunc(ctx, m, f)
 	fnl.After(ctx, m, def, ce.peekValues(typ.ResultNumInUint64))
 	return ctx
